@@ -8,21 +8,38 @@
   outputs =
     { self, nixpkgs }:
     let
+      inherit (nixpkgs) lib;
+
       # Not x86_64-darwin: nixpkgs dropped it in 26.11.
       systems = [
         "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
       ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      forAllSystems = f: lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
       # The Lean → WebAssembly experiment, see experiments/lean-wasm.
       leanWasm = pkgs: import ./experiments/lean-wasm { inherit pkgs; };
+
+      # PocketIC, a local IC replica, from ic-nix (see nix/pocket-ic.nix). An attribute set,
+      # which is empty on aarch64-linux: ic-nix has no binary for it.
+      pocketIc =
+        pkgs:
+        let
+          pocket-ic = pkgs.callPackage ./nix/pocket-ic.nix { };
+        in
+        lib.optionalAttrs (lib.meta.availableOn pkgs.stdenv.hostPlatform pocket-ic) { inherit pocket-ic; };
     in
     {
-      packages = forAllSystems (pkgs: (leanWasm pkgs).packages);
+      packages = forAllSystems (pkgs: (leanWasm pkgs).packages // pocketIc pkgs);
 
-      checks = forAllSystems (pkgs: (leanWasm pkgs).checks);
+      checks = forAllSystems (
+        pkgs:
+        (leanWasm pkgs).checks
+        // lib.optionalAttrs (pocketIc pkgs ? pocket-ic) {
+          pocket-ic-runs = (pocketIc pkgs).pocket-ic.tests.runs;
+        }
+      );
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
@@ -33,7 +50,9 @@
             pkgs.wabt
             # A WebAssembly runtime with WASI support, for running .wasm files.
             pkgs.wasmtime
-          ];
+          ]
+          # `pocket-ic`, a local IC replica, for running canisters.
+          ++ lib.attrValues (pocketIc pkgs);
         };
       });
 
