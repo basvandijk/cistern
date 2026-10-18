@@ -8,7 +8,9 @@ accepts.
 **Answer so far.** The module is well within every structural limit that the IC checks: size,
 number of functions, per-function size and complexity, and Wasm features. It does not have the
 canister interface yet. Its 14 imports are all WASI, and the IC accepts only `ic0` imports. It
-exports `_start`, but no `canister_*` entry points.
+exports `_start`, but no `canister_*` entry points. The [lean-canister](../lean-canister)
+experiment takes the next steps: it replaces WASI with `ic0`, adds the entry points, and measures
+the module in PocketIC, a local IC replica.
 
 All numbers below come from the build outputs, mostly from `report.txt`, except the recursion
 depths and the `String.map` timings, which were measured by hand (see [Recursion
@@ -104,14 +106,14 @@ pointer-sized scalar, so these go through the runtime's arbitrary-precision arit
 Lean code keeps its locals in Wasm locals: none of the functions from Hello.lean or Init is a
 stack user in the report. So its frames are on the engine's native stack, whose size the engine
 sets: 512 KiB by default in wasmtime, and 5 MiB on the IC [6], which
-`wasmtime run -W max-wasm-stack=5242880` reproduces. Native Lean has much more, as
+`wasmtime run -W max-wasm-stack=5242880` sets as well. Native Lean has much more, as
 `lean_run_main` runs `main` on a thread with a 1 GB stack on 64-bit platforms
 ([thread.cpp](https://github.com/leanprover/lean4/blob/v4.34.1/src/runtime/thread.cpp)). The
 single-threaded runtime calls it on the stack it already has. So deep recursion fails much
 sooner on WebAssembly. Of the depths 1,000, 2,000, 5,000, 10,000, ... up to 10,000,000, these
 are the largest that worked:
 
-| Probe                                   | 512 KiB | 5 MiB, as on the IC | 5 MiB, 64 KiB C stack | native     |
+| Probe                                   | 512 KiB |               5 MiB | 5 MiB, 64 KiB C stack | native     |
 | --------------------------------------- | ------: | ------------------: | --------------------: | ---------: |
 | `deep n`                                |  10,000 |             100,000 |               100,000 | 10,000,000 |
 | `(countM n).run 0`                      |   5,000 |              50,000 |                50,000 | 10,000,000 |
@@ -141,6 +143,11 @@ On WebAssembly, the next depth trapped with "call stack exhausted", except in th
 out of stack at the next depth ("Stack overflow detected. Aborting."). The other probes were
 not tried deeper. The probes are one program, linked like `hello.wasm` (for the 64 KiB column,
 without `-z stack-size`), and compiled natively with `leanc`. It is not part of the flake.
+
+These are wasmtime's depths, with Cranelift's default optimizations. The IC compiles canisters
+with them off, which allows more: in PocketIC, `repr` reached 20,000 and `zip` 50,000 of these
+depths. lean-canister measures the exact depths in a derivation, in PocketIC and in wasmtime (see
+[its Recursion depth](../lean-canister/README.md#recursion-depth)).
 
 For a canister, this means that non-tail recursion can trap after some ten thousand levels,
 also in Init functions such as `List.zip` and `repr`.
@@ -278,6 +285,8 @@ the rest of the runtime does not recompile Init. The configuration is minimal:
 
 ## Open questions and next steps
 
+[lean-canister](../lean-canister) has since taken steps 1, 2, 3 and 5.
+
 1. **Replace WASI with `ic0`.** The usual route for C and C++ is
    [ic-wasi-polyfill](https://github.com/wasm-forge/ic-wasi-polyfill), which implements WASI on
    top of the System API, plus [wasi2ic](https://github.com/wasm-forge/wasi2ic), which rewrites
@@ -287,11 +296,12 @@ the rest of the runtime does not recompile Init. The configuration is minimal:
    work: `fd_write` would map to `ic0.debug_print`, `clock_time_get` to `ic0.time`, `proc_exit`
    to `ic0.trap` [2], and `random_get` to a seeded generator, while the arguments and the
    environment would be empty. A runtime without WASI at all would be a third option.
+   lean-canister has such a shim: 12 WASI functions on top of `ic0`.
 2. **Canister entry points.** Lean's `@[export name]` gives a function a fixed C name. A small C
    file can export it under the name the IC expects, for example with
    `__attribute__((export_name("canister_query greet")))`. In the other direction, `@[extern]`
    declares C functions to Lean, so it can declare `ic0` functions that are imported with
-   `import_module("ic0")` [2].
+   `import_module("ic0")` [2]. lean-canister does both.
 3. **Link as a reactor, initialize in `canister_init`.** `hello.wasm` is a WASI command: its
    `_start` runs the C++ constructors, `main` and the destructors, and the IC never calls it.
    Linked with `-mexec-model=reactor` there is no `main`, and `_initialize` runs the
@@ -300,7 +310,9 @@ the rest of the runtime does not recompile Init. The configuration is minimal:
    `initialize_<Module>(1)`, `lean_io_mark_end_initialization()`) then belongs in
    `canister_init` and `canister_post_upgrade`, not in the start function, where most of the
    System API traps [2]. Init reads random bytes during initialization, so a polyfill's
-   generator must be seeded before that.
+   generator must be seeded before that. lean-canister links without crt1 (`-nostartfiles`)
+   instead, and runs the constructors and Lean's initialization in `canister_init` and
+   `canister_post_upgrade`.
 4. **Asynchronous calls.** A canister calls other canisters asynchronously: the reply arrives in
    a later message, through a callback [2]. `IO.Promise` would be the obvious way to model that
    in Lean, but this runtime has no task manager, so it panics (see [Porting the
@@ -310,7 +322,9 @@ the rest of the runtime does not recompile Init. The configuration is minimal:
    300 billion and an update call 40 billion [1].
    [PocketIC](https://docs.internetcomputer.org/guides/testing/pocket-ic.md) runs an IC replica
    locally, which makes it the place to measure, and to confirm the recursion depths above,
-   which come from wasmtime with the IC's stack size.
+   which come from wasmtime with the IC's stack size. In lean-canister, `canister_init` takes
+   7.5 million instructions and the install 6.3 billion, and PocketIC allows more depth than
+   the table above (see [Recursion depth](#recursion-depth)).
 6. **Size.** Size is not a blocker, but Init's initializers keep 1.1 MB of Init in even a hello
    world. A file that starts with `prelude` does not import Init implicitly, and can import just
    the Init modules it needs; whether that helps is untested. Std and Lean code that needs libuv
