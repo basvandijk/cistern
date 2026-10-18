@@ -33,13 +33,26 @@
         lib.optionalAttrs (lib.meta.availableOn pkgs.stdenv.hostPlatform pocket-ic) {
           inherit pocket-ic pocket-ic-py;
         };
+
+      # The Lean canister experiment, which builds on lean-wasm, see experiments/lean-canister.
+      leanCanister =
+        pkgs:
+        import ./experiments/lean-canister {
+          inherit pkgs;
+          leanWasm = leanWasm pkgs;
+          pocket-ic = (pocketIc pkgs).pocket-ic or null;
+          pocket-ic-py = (pocketIc pkgs).pocket-ic-py or null;
+        };
     in
     {
-      packages = forAllSystems (pkgs: (leanWasm pkgs).packages // pocketIc pkgs);
+      packages = forAllSystems (
+        pkgs: (leanWasm pkgs).packages // (leanCanister pkgs).packages // pocketIc pkgs
+      );
 
       checks = forAllSystems (
         pkgs:
         (leanWasm pkgs).checks
+        // (leanCanister pkgs).checks
         // lib.optionalAttrs (pocketIc pkgs ? pocket-ic) {
           pocket-ic-runs = (pocketIc pkgs).pocket-ic.tests.runs;
         }

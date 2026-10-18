@@ -5,7 +5,8 @@
 # pure evaluation does not allow. Building PocketIC from source would also take long: it is
 # a part of the IC repository, and ic-nix's build of it needs the Motoko compiler too. So
 # this uses ic-nix's prebuilt binary, which ic-nix's CI builds with Nix from the IC commit
-# that mainnet was running (its nix/sources.nix). Its releases have it for x86_64-linux and
+# that its nix/sources.nix pins: for release 20261009, the tag
+# release-2026-09-25_03-28--all-in-one. Its releases have it for x86_64-linux and
 # aarch64-darwin only.
 #
 # To update, take a release from https://github.com/ninegua/ic-nix/releases. The hashes are
@@ -63,9 +64,10 @@ stdenv.mkDerivation (finalAttrs: {
   # Unpacking is quicker than sending the tarball (282 MB) to a remote builder.
   preferLocalBuild = true;
 
-  # Starts the server in the sandbox, which has a loopback interface, and has it create an
-  # instance (a replica) with one application subnet through its REST API. $out has the
-  # version and the instance's topology.
+  # Starts the server in the sandbox, and has it create an instance (a replica) with one
+  # application subnet through its REST API. $out has the version and the instance's topology.
+  # Linux's sandbox has a loopback interface; macOS's allows local networking only to a
+  # derivation with __darwinAllowLocalNetworking.
   passthru.tests.runs =
     runCommand "pocket-ic-runs"
       {
@@ -79,6 +81,7 @@ stdenv.mkDerivation (finalAttrs: {
           curl
           jq
         ];
+        __darwinAllowLocalNetworking = true;
       }
       ''
         pocket-ic --version > version.txt

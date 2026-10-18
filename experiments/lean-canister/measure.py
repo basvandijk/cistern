@@ -1,0 +1,711 @@
+"""Installs the Lean canister in PocketIC, checks its replies, and measures its instructions.
+
+Usage: measure.py [--pocket-ic BIN] --hello FILE --hello-a-b FILE [--wasmtime BIN]
+                  [--run-probe WASM] [--native COMMAND] [--about TEXT] [--json FILE] WASM...
+
+Starts a PocketIC server, which BIN runs (default: pocket-ic), and uses it with pocketic-py, its
+Python library (https://github.com/dfinity/pocketic-py): creates an instance with one
+application subnet with the IC's production limits, installs each WASM in a canister of its own,
+and calls the canister's queries (see Canister.lean):
+
+- greet and hello, whose replies must be "Hello, world!" and what Hello.lean prints natively,
+  which the --hello files have (with no arguments, and with the arguments a and b);
+- probe, for the instructions that each probe takes at growing sizes, until one fails.
+
+Then upgrades each canister to the same module. With --run-probe, also runs the recursion probes
+under wasmtime (default: wasmtime) in that program, RunProbe.lean, for their depths there. With
+--native, which is a command that runs RunProbe.lean natively, such as `lean --run RunProbe.lean`
+with LEAN_PATH set, checks the probe results that have no formula, those of repr, against it.
+
+Prints the report on standard output, and writes the measurements to the --json file. Fails if a
+module does not install, or a reply or a probe's result is wrong.
+
+The canister logs how many instructions each message takes (c/canister.c), and PocketIC prints
+the canister's log on its standard error. Queries are counted with ic0.performance_counter,
+which includes the System API's charges, such as the one for each 64 KiB page of memory that a
+message touches. Needs pocketic-py 3, which ../../nix/pocket-ic-py.nix provides.
+"""
+
+import argparse
+import base64
+import gzip
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+from pathlib import Path
+
+import ic
+from ic.candid import Types
+from pocket_ic import PocketIC, SubnetConfig
+
+# The 1-2-5 series of ../lean-wasm/README.md, for the recursion depth.
+DEPTHS = [1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000, 1_000_000,
+          2_000_000, 5_000_000, 10_000_000]
+# The sizes of the String.map table there, doubled further.
+LENGTHS = [10_000, 20_000, 40_000, 80_000, 160_000, 320_000, 640_000, 1_280_000]
+
+# Probes.lean's probes, the sizes to try them at, and their results. repr's has no formula: the
+# length of `toString (repr (List.range n))`, with line breaks, which --native computes.
+PROBES = {
+    "noop": ([0], lambda n: n),
+    "deep": (DEPTHS, lambda n: n),
+    "countM": (DEPTHS, lambda n: n),
+    "repr": (DEPTHS, None),
+    "zip": (DEPTHS, lambda n: n),
+    "deepK": (DEPTHS, lambda n: n),
+    "deepKB": (DEPTHS, lambda n: 2**70 + n),
+    "toUpper": (LENGTHS, lambda n: n),
+    "toUpperNonAscii": (LENGTHS, lambda n: n),
+}
+# Sizes at which each probe runs twice in one query, which shows what its first run costs more.
+TWICE = {"noop": 0, "deep": 1_000, "countM": 1_000, "repr": 1_000, "zip": 1_000, "deepK": 1_000,
+         "deepKB": 1_000, "toUpper": 10_000, "toUpperNonAscii": 10_000}
+# The probes whose depth is limited by the stack, which run under wasmtime too.
+RECURSIVE = [name for name, (sizes, _) in PROBES.items() if sizes is DEPTHS]
+
+# The IC's Wasm stack (MAX_WASM_STACK_SIZE in rs/embedders/src/lib.rs).
+WASM_STACK = 5 * 1024 * 1024
+
+
+class Server:
+    """A PocketIC server, with its standard output and error in files: the replica's log and the
+    canisters' logs, which measure.py reads.
+
+    pocketic-py's PocketIC starts a server of its own, whose output would go to this process's,
+    unless it finds one running: one that writes the port file whose name has this process's id
+    (PocketICServer). So this server writes that port file. The server that pocketic-py starts
+    then finds the file, and exits at once."""
+
+    def __init__(self, binary, workdir):
+        self.binary = shutil.which(binary) or binary
+        self.port_file = port_file = Path(tempfile.gettempdir(), f"pocket_ic_{os.getpid()}.port")
+        # A server writes its port file only if there is none: this one would be stale, from a
+        # process of the same id that has ended.
+        port_file.unlink(missing_ok=True)
+        self.stdout = LogFile(Path(workdir, "stdout"))
+        self.stderr = LogFile(Path(workdir, "stderr"))
+        # The replica logs what each install_code took on stdout, at the instance's log_level.
+        # RUST_LOG would override that level, and LOG_TO_STDERR move the log to stderr.
+        env = {k: v for k, v in os.environ.items() if k not in ("RUST_LOG", "LOG_TO_STDERR")}
+        with open(self.stdout.path, "wb") as out, open(self.stderr.path, "wb") as err:
+            self.process = subprocess.Popen(
+                [self.binary, "--port-file", port_file, "--ttl", "600"], stdout=out, stderr=err,
+                env=env,
+            )
+        try:
+            # The server writes its port, followed by a newline, once it listens.
+            for _ in range(600):
+                if port_file.exists() and port_file.read_text().endswith("\n"):
+                    break
+                if self.process.poll() is not None:
+                    raise RuntimeError(f"pocket-ic exited with {self.process.returncode}")
+                time.sleep(0.1)
+            else:
+                raise RuntimeError("pocket-ic did not start")
+            self.url = f"http://127.0.0.1:{int(port_file.read_text())}"
+        except BaseException:
+            self.process.kill()
+            self.process.wait()
+            port_file.unlink(missing_ok=True)
+            self.show_stderr()
+            raise
+
+    def close(self):
+        self.process.send_signal(signal.SIGTERM)
+        try:
+            self.process.wait(60)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+        # The server removes its port file when it stops, but not when it is killed or crashes.
+        self.port_file.unlink(missing_ok=True)
+
+    def show_stderr(self):
+        """Prints the end of the server's standard error, which says why it failed, before the
+        file goes with its directory."""
+        if text := self.stderr.path.read_text(errors="replace")[-4000:]:
+            sys.stderr.write(f"measure.py: PocketIC's standard error ends with:\n{text}\n")
+
+    def log(self):
+        """What the canisters have logged since the last call: (canister id, line) pairs. PocketIC
+        prints each ic0.debug_print on its standard error as "<time> UTC: [Canister <id>] <line>"."""
+        lines = []
+        for line in self.stderr.new_lines():
+            if m := re.fullmatch(r"\S+ \S+ UTC: \[Canister ([a-z0-9-]+)\] (.*)", line):
+                lines.append((m[1], m[2]))
+        return lines
+
+
+class LogFile:
+    """A file that a process writes lines to."""
+
+    def __init__(self, path):
+        self.path, self.offset = path, 0
+
+    def new_lines(self):
+        """The complete lines written since the last call. Only "\\n" ends a line: a canister's
+        log record may contain other line breaks."""
+        with open(self.path, "rb") as f:
+            f.seek(self.offset)
+            data = f.read()
+        data = data[: data.rfind(b"\n") + 1]
+        self.offset += len(data)
+        return data.decode(errors="replace").split("\n")[:-1]
+
+
+class Instance(PocketIC):
+    """pocketic-py's PocketIC, whose instance measure_canisters deletes, while the server runs.
+    PocketIC.__del__ would delete it when the object goes. After an error, that is after
+    Server.close has stopped the server, and it would print a ConnectionError then. A server that
+    stops deletes its instances itself."""
+
+    def __del__(self):
+        pass
+
+
+class Subnets(SubnetConfig):
+    """pocketic-py's SubnetConfig, with the replica's log at level info, where it logs what each
+    install_code took."""
+
+    def _json(self):
+        return {**super()._json(), "log_level": "info"}
+
+
+def pocket_ic(server):
+    """An instance on the server, through pocketic-py: one application subnet with the IC's
+    production limits (SubnetConfig's "instruction_config": "Production")."""
+    # pocketic-py checks that the binary exists, and starts it; it exits at once (see Server).
+    os.environ["POCKET_IC_BIN"] = server.binary
+    os.environ["POCKET_IC_MUTE_SERVER"] = "1"
+    # The server is local. requests, which pocketic-py uses, would send to an http_proxy.
+    os.environ["no_proxy"] = "127.0.0.1"
+    pic = Instance(Subnets(application=1))
+    check(pic.server.url == server.url, f"pocketic-py uses {pic.server.url}, not {server.url}")
+    # The server answers a request that takes longer than it waits, 10 seconds by default, with
+    # 202, and the result has to be polled, which pocketic-py does not do. This waits 10 minutes.
+    pic.server.request_client.headers["processing-timeout-ms"] = "600000"
+    return pic
+
+
+# pocketic-py raises a ValueError with this message for a call that the IC rejects.
+REJECTION = re.compile(
+    r"PocketIC returned a rejection error: reject code (\w+), reject message (.*), error code (\w+)",
+    re.DOTALL,
+)
+
+
+def call(make_call):
+    """The result of a call through pocketic-py: ("reply", bytes), or ("reject", {reject_code,
+    reject_message, error_code})."""
+    try:
+        # A list of the reply's bytes, or bytes if they start like Candid.
+        return "reply", bytes(make_call())
+    except ValueError as e:
+        if m := REJECTION.fullmatch(str(e)):
+            return "reject", {"reject_code": m[1], "reject_message": m[2], "error_code": m[3]}
+        raise
+
+
+# install_code's argument, as in pocketic-py's install_code, which installs only. For "upgrade",
+# whose type is opt record { ... }, null stands for that.
+INSTALL_CODE_ARG = Types.Record({
+    "mode": Types.Variant({"install": Types.Null, "upgrade": Types.Null}),
+    "canister_id": Types.Principal,
+    "wasm_module": Types.Vec(Types.Nat8),
+    "arg": Types.Vec(Types.Nat8),
+})
+
+# What c/canister.c logs at the end of each entry point.
+ENTRY_LINE = re.compile(
+    r"(canister_init|canister_post_upgrade|canister_query \w+): (\d+) instructions,"
+    r" (\d+) ic0\.time calls(?: \((.*)\))?"
+)
+
+
+class Canister:
+    def __init__(self, server, pic, wasm):
+        self.server, self.pic, self.name = server, pic, Path(wasm).name
+        self.module = Path(wasm).read_bytes()
+        self.id = pic.create_canister()
+        self.text_id = self.id.to_str()
+
+    def expect_reply(self, result):
+        kind, value = result
+        if kind != "reply":
+            raise RuntimeError(f"{self.name}: unexpected reject: {value}")
+        return value
+
+    def time(self):
+        """The instance's time, in nanoseconds. As nothing sets it, each round advances it by 1."""
+        return self.pic.get_time()["nanos_since_epoch"]
+
+    def _entry(self, make_call, entry):
+        """Makes the call, and returns its result with what the canister logged. The log ends
+        with c/canister.c's line for the entry point, unless the message trapped."""
+        result = call(make_call)
+        reached_end = result[0] == "reply" or result[1]["error_code"] == "CanisterRejectedMessage"
+        lines, deadline = [], time.monotonic() + 10
+        while True:
+            lines += [line for id, line in self.server.log() if id == self.text_id]
+            if not reached_end or (lines and ENTRY_LINE.fullmatch(lines[-1])) or time.monotonic() > deadline:
+                break
+            time.sleep(0.01)
+        m = ENTRY_LINE.fullmatch(lines[-1]) if lines else None
+        if reached_end and not (m and m[1] == entry):
+            raise RuntimeError(f"{self.name}: no log line for {entry} after {result}: {lines}")
+        measured = None
+        if m:
+            lines.pop()
+            measured = {"instructions": int(m[2]), "ic0.time calls": int(m[3])}
+            for part in (m[4] or "").split(", ") if m[4] else []:
+                what, n = part.rsplit(" ", 1)
+                measured[what] = int(n)
+        return result, lines, measured
+
+    def install(self, mode):
+        """Installs the module gzipped, which the IC accepts: in one message, which may have at
+        most 2 MiB, with room to spare.
+
+        The IC charges the instructions of an install_code to the canister, and refuses the
+        next until the rounds have paid them off, at 2 billion per round. So this tries again
+        until the IC accepts. pocketic-py executes rounds until a call is done, and the rounds
+        are counted by the instance's time."""
+        arg = ic.encode([{"type": INSTALL_CODE_ARG, "value": {
+            "mode": {mode: None},
+            "canister_id": self.id.bytes,
+            "wasm_module": gzip.compress(self.module, 9, mtime=0),
+            "arg": b"",
+        }}])
+        # The management canister routes the call by the canister id in its argument.
+        effective = {"CanisterId": base64.b64encode(self.id.bytes).decode()}
+        entry = "canister_init" if mode == "install" else "canister_post_upgrade"
+        self.server.stdout.new_lines()
+        start, refused = self.time(), 0
+        while True:
+            tried = self.time()
+            result, lines, measured = self._entry(
+                lambda: self.pic.update_call_with_effective_principal(None, effective, "install_code", arg),
+                entry,
+            )
+            if result[0] == "reply" or result[1]["error_code"] != "CanisterInstallCodeRateLimited":
+                break
+            refused += 1
+            check(refused < 100, f"{self.name}: install_code still rate limited after 100 tries")
+        self.expect_reply(result)
+        rounds = {
+            "refused tries": refused,
+            # Counted from the round of the last install_code.
+            "refusing rounds": tried - start,
+            "accepted in round": tried - start + 1,
+            # More than one if the IC splits it into slices (deterministic time slicing).
+            "rounds taken": self.time() - tried,
+        }
+        # What the replica logs about the install, on PocketIC's standard output.
+        replica, deadline = {}, time.monotonic() + 10
+        while len(replica) < 2 and time.monotonic() < deadline:
+            for line in self.server.stdout.new_lines():
+                if m := re.search(rf"Executing \({entry}\) on canister {self.text_id} consumed (\d+) instructions", line):
+                    replica[entry] = int(m[1])
+                if m := re.search(rf"Finished executing install_code message on canister {self.text_id} .*instructions consumed: ([\d_]+)$", line):
+                    replica["install_code"] = int(m[1].replace("_", ""))
+            time.sleep(0.01)
+        check(len(replica) == 2, f"{self.name}: the replica's log of the install is {replica}")
+        return {"log": lines, **measured, **rounds, "replica": replica}
+
+    def query(self, method, arg):
+        payload = arg if isinstance(arg, bytes) else arg.encode()
+        result, lines, measured = self._entry(
+            lambda: self.pic.query_call(self.id, method, payload), f"canister_query {method}"
+        )
+        kind, value = result
+        return {
+            "reply": value.decode() if kind == "reply" else None,
+            "reject": None if kind == "reply" else value["reject_message"],
+            "error_code": None if kind == "reply" else value["error_code"],
+            "log": lines,
+            **(measured or {}),
+        }
+
+
+def check(ok, what):
+    if not ok:
+        raise SystemExit(f"measure.py: check failed: {what}")
+
+
+def check_result(where, name, n, result):
+    expected = PROBES[name][1]
+    check(expected is None or result == expected(n), f"{where}: probe {name} {n}: {result}")
+
+
+def largest(sizes, attempt):
+    """Runs attempt(n) at growing sizes until it fails, and then finds the largest size at which
+    it works, by bisection. attempt returns a dict with "n", and "failure" if it failed. Returns
+    the runs at the sizes, and {"works", "fails", "bisection"}: the runs at the largest size that
+    worked and at the next size, which failed, and those of the bisection; or None if none failed
+    or the first did."""
+    runs = []
+    for n in sizes:
+        runs.append(attempt(n))
+        if "failure" in runs[-1]:
+            break
+    if "failure" not in runs[-1] or len(runs) == 1:
+        return runs, None
+    works, fails = runs[-2], runs[-1]
+    bisection = []
+    while fails["n"] - works["n"] > 1:
+        run = attempt((works["n"] + fails["n"]) // 2)
+        bisection.append(run)
+        works, fails = (works, run) if "failure" in run else (run, fails)
+    return runs, {"works": works, "fails": fails, "bisection": bisection}
+
+
+def measure(canister, expected_hello):
+    """Everything about one canister, as a dict for the JSON file."""
+    out = {"module": canister.name, "canister": canister.text_id, "install": canister.install("install")}
+    check(not out["install"]["log"], f"{canister.name}: canister_init logged {out['install']['log']}")
+
+    queries = out["queries"] = {
+        "greet world": canister.query("greet", "world"),
+        "greet 0xff": canister.query("greet", b"\xff"),
+        "hello": canister.query("hello", ""),
+        "hello a b": canister.query("hello", "a b"),
+        "probe nosuch 1": canister.query("probe", "nosuch 1"),
+    }
+    check(queries["greet world"]["reply"] == "Hello, world!", f"greet: {queries['greet world']}")
+    check(queries["greet world"]["log"] == ["greeting world"], f"greet's log: {queries['greet world']}")
+    check(queries["greet 0xff"]["reject"] == "the argument is not UTF-8", f"greet: {queries['greet 0xff']}")
+    for key, expected in expected_hello.items():
+        check(queries[key]["reply"] == expected, f"{key}: {queries[key]['reply']!r} instead of {expected!r}")
+    check(queries["probe nosuch 1"]["reject"] == "there is no probe nosuch", f"probe: {queries['probe nosuch 1']}")
+
+    # Each probe at growing sizes, until it fails, and then the largest size that works, by
+    # bisection. Each argument is new: the replica answers a query that it has answered before
+    # from its cache, without executing it.
+    out["probes"], out["largest"] = {}, {}
+    for name, (sizes, _) in PROBES.items():
+
+        def probe(n):
+            q = canister.query("probe", f"{name} {n}")
+            run = {"n": n, "total": q.get("instructions")}
+            if q["reply"] is None:
+                run["failure"] = q["reject"]
+            else:
+                reply = json.loads(q["reply"])
+                check_result(canister.name, name, n, reply["result"])
+                run.update(result=reply["result"], instructions=reply["instructions"][0])
+            return run
+
+        out["probes"][name], largest_run = largest(sizes, probe)
+        if largest_run:
+            out["largest"][name] = largest_run
+
+    out["twice"] = {}
+    for name, n in TWICE.items():
+        q = canister.query("probe", f"{name} {n} 2")
+        check(q["reply"] is not None, f"probe {name} {n} 2: {q}")
+        reply = json.loads(q["reply"])
+        check_result(canister.name, name, n, reply["result"])
+        out["twice"][name] = {"n": n, "result": reply["result"], "instructions": reply["instructions"]}
+
+    # After the upgrade, the canister runs canister_post_upgrade, in new memory.
+    out["upgrade"] = canister.install("upgrade")
+    check(not out["upgrade"]["log"], f"{canister.name}: canister_post_upgrade logged {out['upgrade']['log']}")
+    out["queries"]["greet upgraded"] = q = canister.query("greet", "upgraded")
+    check(q["reply"] == "Hello, upgraded!", f"greet after the upgrade: {q}")
+    return out
+
+
+def measure_canisters(server, wasms, expected_hello):
+    """Each module in a canister of its own, in one instance, which this deletes at the end."""
+    pic = pocket_ic(server)
+    canisters = [Canister(server, pic, wasm) for wasm in wasms]
+    results = [measure(c, expected_hello) for c in canisters]
+    pic.server.delete_instance(pic.instance_id)
+    return results
+
+
+# wasmtime
+
+
+class Wasmtime:
+    """run-probe.wasm under wasmtime, with the IC's Wasm stack, compiled once with `options`."""
+
+    def __init__(self, binary, wasm, cwasm, options):
+        self.binary, self.cwasm = binary, cwasm
+        # Without wasmtime's cache, which would be in $HOME.
+        subprocess.run([binary, "compile", "-C", "cache=n", *options, wasm, "-o", cwasm], check=True)
+
+    def attempt(self, name, n):
+        p = subprocess.run(
+            [self.binary, "run", "-C", "cache=n", "--allow-precompiled", "-W",
+             f"max-wasm-stack={WASM_STACK}", self.cwasm, name, str(n)],
+            capture_output=True, text=True,
+        )
+        if p.returncode == 0:
+            result = int(p.stdout)
+            check_result("run-probe.wasm", name, n, result)
+            return {"n": n, "result": result}
+        # Anything but a stack overflow is an error, so that it does not pass for one.
+        check("wasm trap: call stack exhausted" in p.stderr, f"run-probe.wasm {name} {n}: {p.stderr}")
+        return {"n": n, "failure": "stack overflow"}
+
+
+def measure_wasmtime(binary, wasm, workdir):
+    """The recursion probes' depths under wasmtime, with Cranelift's default optimizations, and
+    with them off, as the IC compiles."""
+    version = subprocess.run([binary, "--version"], capture_output=True, text=True, check=True).stdout
+    out = {"version": version.strip(), "configurations": {}}
+    for label, options in [("wasmtime", []), ("wasmtime -O opt-level=0", ["-O", "opt-level=0"])]:
+        engine = Wasmtime(binary, wasm, Path(workdir, f"run-probe-{len(out['configurations'])}.cwasm"), options)
+        probes = out["configurations"][label] = {}
+        for name in RECURSIVE:
+            runs, largest_run = largest(DEPTHS, lambda n: engine.attempt(name, n))
+            probes[name] = {"runs": runs, "largest": largest_run}
+    return out
+
+
+def check_natively(command, results, wasmtime):
+    """Checks the probe results that have no formula against those of `command`, which runs
+    RunProbe.lean natively."""
+    for name, (_, expected) in PROBES.items():
+        if expected is not None:
+            continue
+        found = []  # (where, n, result)
+        for r in results:
+            runs = r["probes"][name] + (r["largest"][name]["bisection"] if name in r["largest"] else [])
+            found += [(r["module"], run["n"], run["result"]) for run in runs if "result" in run]
+            found.append((r["module"], r["twice"][name]["n"], r["twice"][name]["result"]))
+        for label, probes in (wasmtime or {}).get("configurations", {}).items():
+            if name in probes:
+                p = probes[name]
+                runs = p["runs"] + (p["largest"]["bisection"] if p["largest"] else [])
+                found += [(label, run["n"], run["result"]) for run in runs if "result" in run]
+        sizes = sorted({n for _, n, _ in found})
+        # `lean --run` prints its errors on standard output.
+        p = subprocess.run([*shlex.split(command), name, *map(str, sizes)], capture_output=True,
+                           text=True)
+        check(p.returncode == 0, f"{command} {name}: exit {p.returncode}: {p.stdout}{p.stderr}")
+        values = p.stdout.split()
+        check(len(values) == len(sizes), f"{command} {name}: {p.stdout!r}")
+        native = dict(zip(sizes, map(int, values)))
+        for where, n, result in found:
+            check(result == native[n], f"{where}: probe {name} {n}: {result}, natively {native[n]}")
+
+
+# The report
+
+
+WIDTH = 92
+
+
+def fill(text, indent=""):
+    return textwrap.fill(text, WIDTH, initial_indent=indent, subsequent_indent=indent,
+                         break_on_hyphens=False)
+
+
+def heading(title):
+    print(f"\n{title}\n{'-' * len(title)}")
+
+
+def table(header, rows, text=(0,)):
+    """Prints rows of cells. The columns in `text` are left-aligned, the others right-aligned."""
+    rows = [header, *rows]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(header))]
+    for row in rows:
+        cells = [c.ljust(w) if i in text else c.rjust(w) for i, (c, w) in enumerate(zip(row, widths))]
+        print("  " + "  ".join(cells).rstrip())
+
+
+def number(n):
+    return "" if n is None else f"{n:,}"
+
+
+def failure(message):
+    """The gist of a reject message, as the replica phrases it."""
+    for pattern, gist in [
+        (r"Canister trapped: stack overflow", "stack overflow"),
+        (r"Canister exceeded the limit of \d+ instructions", "instruction limit"),
+        (r"Canister trapped: (.*?)\.?\n", lambda m: f"trap: {m[1]}"),
+        (r"Canister called `ic0.trap` with message: '(.*?)'", lambda m: f"ic0.trap: {m[1]}"),
+    ]:
+        if m := re.search(pattern, message):
+            return gist if isinstance(gist, str) else gist(m)
+    return message.splitlines()[0]
+
+
+def report(about, modules, results, wasmtime):
+    names = [r["module"] for r in results]
+    title = "Report on " + " and ".join(names)
+    print(f"{title}\n{'=' * len(title)}\n")
+    print(fill(about))
+
+    heading("Modules")
+    table(["module", "bytes", "gzipped"],
+          [[r["module"], number(len(m)), number(len(gzip.compress(m, 9, mtime=0)))]
+           for r, m in zip(results, modules)])
+    print(fill("Each was installed in a canister of its own: "
+               + ", ".join(f"{r['module']} in {r['canister']}" for r in results) + ".", "  "))
+
+    heading("Installation and upgrade")
+    print(fill("Instructions. install_code is the replica's count for the whole message, from its"
+               " log; it includes compiling the module. canister_init is what"
+               " ic0.performance_counter counts at its end, before canister.c logs it, with the"
+               " parts that canister.c measures: the C++ constructors,"
+               " lean_initialize_runtime_module, and initialize_Canister, which runs the"
+               " initializers of Canister.lean and its imports. ic0.time calls are those of"
+               " clock_time_get (c/wasi.c). Then an upgrade to the same module, which runs"
+               " canister_post_upgrade, tried right after the install and then again until the IC"
+               " accepts it: it refuses install_code for a canister"
+               " (CanisterInstallCodeRateLimited) until the rounds have paid off the"
+               " instructions of its last one. The rounds are counted from the install's, by the"
+               " instance's time.", "  "))
+    print()
+    rows = []
+    for label, get in [
+        ("install_code", lambda r: r["install"]["replica"]["install_code"]),
+        ("  canister_init (replica)", lambda r: r["install"]["replica"]["canister_init"]),
+        ("  canister_init", lambda r: r["install"]["instructions"]),
+        ("    C++ constructors", lambda r: r["install"]["constructors"]),
+        ("    Lean runtime", lambda r: r["install"]["runtime"]),
+        ("    module initializers", lambda r: r["install"]["module initializers"]),
+        ("    ic0.time calls", lambda r: r["install"]["ic0.time calls"]),
+        ("rounds that refused the upgrade", lambda r: r["upgrade"]["refusing rounds"]),
+        ("round that accepted it", lambda r: r["upgrade"]["accepted in round"]),
+        ("rounds that it took", lambda r: r["upgrade"]["rounds taken"]),
+        ("install_code (upgrade)", lambda r: r["upgrade"]["replica"]["install_code"]),
+        ("  canister_post_upgrade (replica)", lambda r: r["upgrade"]["replica"]["canister_post_upgrade"]),
+        ("  canister_post_upgrade", lambda r: r["upgrade"]["instructions"]),
+    ]:
+        rows.append([label] + [number(get(r)) for r in results])
+    table([""] + names, rows)
+
+    heading("Queries")
+    print(fill("Instructions of each query up to its end, as c/canister.c logs them there; the"
+               " logging itself takes some thousand more, which the count cannot include (for"
+               " canister_init, the difference to the replica's count above). The replies are"
+               " checked: greet's against \"Hello, <argument>!\", hello's against what Hello.lean"
+               " prints natively.", "  "))
+    print()
+    rows = []
+    for key, label in [("greet world", 'greet "world"'), ("greet upgraded", 'greet "upgraded" (after the upgrade)'),
+                       ("hello", 'hello ""'), ("hello a b", 'hello "a b"'),
+                       ("greet 0xff", "greet 0xff (rejected: not UTF-8)"),
+                       ("probe nosuch 1", 'probe "nosuch 1" (rejected)')]:
+        rows.append([label] + [number(r["queries"][key].get("instructions")) for r in results])
+    table(["query"] + names, rows)
+
+    heading("Limits")
+    text = ("The largest size at which each probe worked, and why it failed at the next size:"
+            " the 5 MiB Wasm stack, or the limit of 5,000,000,000 instructions for a query."
+            " Found by bisection, after the sizes of the table below. The other probes worked"
+            " at every size there.")
+    if wasmtime:
+        text += (f" The last columns are the depths of run-probe.wasm, the same probes in a"
+                 f" WASI program, under {wasmtime['version']} with the same stack"
+                 f" (-W max-wasm-stack={WASM_STACK}): with Cranelift's default optimizations,"
+                 f" and with -O opt-level=0, which is how the IC compiles. There the next depth"
+                 f" ran out of stack (\"call stack exhausted\").")
+    print(fill(text, "  "))
+    print()
+    configurations = (wasmtime or {}).get("configurations", {})
+    rows = []
+    for name in PROBES:
+        if not any(name in r["largest"] for r in results):
+            continue
+        largest_run = [r["largest"].get(name) for r in results]
+        reasons = {failure(l["fails"]["failure"]) for l in largest_run if l}
+        cells = [name] + [number(l["works"]["n"]) if l else "none failed" for l in largest_run]
+        cells.append(" / ".join(sorted(reasons)))
+        for probes in configurations.values():
+            l = probes.get(name, {}).get("largest")
+            cells.append(number(l["works"]["n"]) if l else "")
+        rows.append(cells)
+    table(["probe"] + names + ["then"] + list(configurations), rows, text=(0, len(names) + 1))
+
+    heading("Instructions of the probes")
+    print(fill("The instructions that each probe took in a query of its own, as"
+               " Ic0.countInstructions counts them: the work, without preparing the input."
+               " In brackets, those of the query, as above.", "  "))
+    for name, (sizes, _) in PROBES.items():
+        print()
+        rows = []
+        for i, n in enumerate(sizes):
+            if all(i >= len(r["probes"][name]) for r in results):
+                break
+            cells = [f"{name} {n:,}"]
+            for r in results:
+                runs = r["probes"][name]
+                if i >= len(runs):
+                    cells.append("")
+                elif "failure" in runs[i]:
+                    cells.append(failure(runs[i]["failure"]))
+                else:
+                    cells.append(f"{number(runs[i]['instructions'])} [{number(runs[i]['total'])}]")
+            rows.append(cells)
+        table(["probe, n"] + names, rows)
+
+    heading("First and second run")
+    print(fill("Each probe twice in one query. The first run also pays for what the second finds"
+               " ready: the IC's charge for each 64 KiB page of memory that the message has not"
+               " touched yet, and Lean's lazily initialized constants (closed terms), which a"
+               " query recomputes, as it discards its changes to memory.", "  "))
+    print()
+    rows = []
+    for name, twice in results[0]["twice"].items():
+        cells = [f"{name} {twice['n']:,}"]
+        for r in results:
+            first, second = r["twice"][name]["instructions"]
+            cells.append(f"{number(first)} / {number(second)}")
+        rows.append(cells)
+    table(["probe, n"] + [f"{n}: first / second" for n in names], rows)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--pocket-ic", default="pocket-ic")
+    parser.add_argument("--hello", required=True, type=Path)
+    parser.add_argument("--hello-a-b", required=True, type=Path)
+    parser.add_argument("--wasmtime", default="wasmtime")
+    parser.add_argument("--run-probe", type=Path)
+    parser.add_argument("--native")
+    parser.add_argument("--about", default="")
+    parser.add_argument("--json", type=Path)
+    parser.add_argument("wasm", nargs="+", type=Path)
+    args = parser.parse_args()
+    expected_hello = {"hello": args.hello.read_text(), "hello a b": args.hello_a_b.read_text()}
+
+    with tempfile.TemporaryDirectory() as workdir:
+        server = Server(args.pocket_ic, workdir)
+        try:
+            results = measure_canisters(server, args.wasm, expected_hello)
+        except Exception:  # not a failed check (SystemExit), or Ctrl-C
+            server.show_stderr()
+            raise
+        finally:
+            server.close()
+        wasmtime = args.run_probe and measure_wasmtime(args.wasmtime, args.run_probe, workdir)
+
+    # The modules must agree, also where the expected result is not known.
+    for name in PROBES:
+        sets = [{run["n"]: run["result"] for run in r["probes"][name] if "result" in run} for r in results]
+        common = set.intersection(*(set(s) for s in sets))
+        check(all(len({s[n] for s in sets}) == 1 for n in common), f"probe {name}: modules disagree")
+    if args.native:
+        check_natively(args.native, results, wasmtime)
+
+    report(args.about, [w.read_bytes() for w in args.wasm], results, wasmtime)
+    if args.json:
+        measurements = {"modules": results, "wasmtime": wasmtime or None}
+        args.json.write_text(json.dumps(measurements, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()
