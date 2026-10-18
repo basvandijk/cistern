@@ -21,14 +21,18 @@
       # The Lean → WebAssembly experiment, see experiments/lean-wasm.
       leanWasm = pkgs: import ./experiments/lean-wasm { inherit pkgs; };
 
-      # PocketIC, a local IC replica, from ic-nix (see nix/pocket-ic.nix). An attribute set,
+      # PocketIC, a local IC replica, from ic-nix (see nix/pocket-ic.nix), and pocketic-py, its
+      # Python library, in a Python environment (see nix/pocket-ic-py.nix). An attribute set,
       # which is empty on aarch64-linux: ic-nix has no binary for it.
       pocketIc =
         pkgs:
         let
           pocket-ic = pkgs.callPackage ./nix/pocket-ic.nix { };
+          pocket-ic-py = pkgs.callPackage ./nix/pocket-ic-py.nix { };
         in
-        lib.optionalAttrs (lib.meta.availableOn pkgs.stdenv.hostPlatform pocket-ic) { inherit pocket-ic; };
+        lib.optionalAttrs (lib.meta.availableOn pkgs.stdenv.hostPlatform pocket-ic) {
+          inherit pocket-ic pocket-ic-py;
+        };
     in
     {
       packages = forAllSystems (pkgs: (leanWasm pkgs).packages // pocketIc pkgs);
@@ -51,7 +55,8 @@
             # A WebAssembly runtime with WASI support, for running .wasm files.
             pkgs.wasmtime
           ]
-          # `pocket-ic`, a local IC replica, for running canisters.
+          # `pocket-ic`, a local IC replica, for running canisters, and `python3` with pocketic-py,
+          # its Python library.
           ++ lib.attrValues (pocketIc pkgs);
         };
       });
