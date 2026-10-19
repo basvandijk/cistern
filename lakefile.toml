@@ -1,0 +1,29 @@
+# Lake's configuration, for editors: the Nix flake builds the experiments without Lake.
+#
+# Lean's editor support, which the VS Code extension starts as `lake serve` in the directory with
+# lean-toolchain, finds the modules that a .lean file imports through the libraries below, and
+# builds them in .lake. VS Code does so when it opens the file because .vscode/settings.json
+# turns on lean4.automaticallyBuildDependencies. A module that a file imports must be one of a
+# library's `roots`. As in the Nix builds (`lean -R .`), a module is named after its file alone,
+# without the directory: experiments/lean-canister/Canister.lean is the module `Canister`, which
+# imports `Hello`, experiments/lean-wasm/Hello.lean.
+#
+# lean-toolchain names the version of the flake's Lean. elan, which runs Lean for the VS Code
+# extension, installs the official release of that version. That is a different build from the
+# flake's, and Lake tells the two apart by their git commit (the flake's has none), so the dev
+# shell's `lake` and the editor each rebuild what the other built in .lake. The check
+# `lean-files-open` (nix/lean-files-open.nix) fails if lean-toolchain names another version, or
+# if a .lean file has an error when opened. Lake writes lake-manifest.json, which lists no
+# dependencies.
+name = "cistern"
+defaultTargets = ["lean-wasm", "lean-canister"]
+
+[[lean_lib]]
+name = "lean-wasm"
+srcDir = "experiments/lean-wasm"
+roots = ["Hello"]
+
+[[lean_lib]]
+name = "lean-canister"
+srcDir = "experiments/lean-canister"
+roots = ["Ic0", "Probes", "Canister", "RunProbe"]

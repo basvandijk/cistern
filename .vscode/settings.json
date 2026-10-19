@@ -1,0 +1,7 @@
+{
+  // Build the modules that a .lean file imports when VS Code opens it (see lakefile.toml),
+  // instead of showing "Imports are out of date and must be rebuilt" on its first line until the
+  // command "Lean 4: Server: Restart File". The extension leaves this off so as not to start long
+  // builds by accident; here the imports are a few small modules.
+  "lean4.automaticallyBuildDependencies": true
+}

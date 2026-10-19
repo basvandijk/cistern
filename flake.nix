@@ -56,6 +56,10 @@
         // lib.optionalAttrs (pocketIc pkgs ? pocket-ic) {
           pocket-ic-runs = (pocketIc pkgs).pocket-ic.tests.runs;
         }
+        // {
+          # Each .lean file opens in an editor without errors, see nix/lean-files-open.nix.
+          lean-files-open = pkgs.callPackage ./nix/lean-files-open.nix { };
+        }
       );
 
       devShells = forAllSystems (pkgs: {
