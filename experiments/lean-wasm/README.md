@@ -285,7 +285,8 @@ the rest of the runtime does not recompile Init. The configuration is minimal:
 
 ## Open questions and next steps
 
-[lean-canister](../lean-canister) has since taken steps 1, 2, 3 and 5.
+[lean-canister](../lean-canister) has since taken steps 1, 2, 3 and 5. Of step 9, it tried the
+Wasm memory between messages and across an upgrade, but not stable memory or `opt keep`.
 
 1. **Replace WASI with `ic0`.** The usual route for C and C++ is
    [ic-wasi-polyfill](https://github.com/wasm-forge/ic-wasi-polyfill), which implements WASI on
@@ -338,7 +339,11 @@ the rest of the runtime does not recompile Init. The configuration is minimal:
    naturals above 2^31 - 1 are bignums.
 9. **State.** The Lean heap lives in Wasm memory. The IC keeps that memory between messages but
    discards it on upgrade, unless `wasm_memory_persistence` is `opt keep` [2]. Anything that has
-   to survive upgrades needs stable memory.
+   to survive upgrades needs stable memory. lean-canister keeps state in an `IO.Ref`: an update's
+   changes stay, unless it traps, and a query's are discarded
+   ([State across updates](../lean-canister/README.md#state-across-updates)). `opt keep` needs a
+   module with the custom section `icp:private enhanced-orthogonal-persistence`
+   ([its next steps](../lean-canister/README.md#open-questions-and-next-steps)).
 
 ## Sources
 
