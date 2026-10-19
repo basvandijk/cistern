@@ -3,7 +3,8 @@
 #
 # Interface (used by ../default.nix):
 #   A derivation with $out/report.txt, and the measurements in $out/measurements.json. It fails
-#   to build if a module does not install, or a reply or a probe's result is wrong.
+#   to build if a module does not install or upgrade, or a reply, a probe's result or the state
+#   is wrong.
 {
   stdenv,
   runCommand,

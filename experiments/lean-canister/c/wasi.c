@@ -38,10 +38,10 @@ wasi-libc:
   random_get        One fixed sequence (splitmix64 from 0), the same in every canister. It
                     continues across the messages whose changes to memory the IC keeps, and starts
                     again with an upgrade, which starts with new memory: canister_init and
-                    canister_post_upgrade take the first 8 bytes, for Init's random generator,
-                    and every query starts from there, as the IC discards a query's changes. A
-                    canister gets randomness from the management canister's raw_rand, which takes
-                    a call to another canister.
+                    canister_post_upgrade take the first 8 bytes, for Init's random generator.
+                    A query starts where the last message whose changes the IC kept left it, as
+                    the IC discards a query's changes. A canister gets randomness from the
+                    management canister's raw_rand, which takes a call to another canister.
 
 Other file descriptors than 0, 1 and 2 are EBADF.
 */

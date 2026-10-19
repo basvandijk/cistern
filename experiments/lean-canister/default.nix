@@ -37,8 +37,8 @@ let
     init = leanWasm.packages.lean-wasm-init;
   };
 
-  # Installs both canister modules in PocketIC, checks their replies and measures them, and
-  # run-probe.wasm under wasmtime.
+  # Installs both canister modules in PocketIC, checks their replies and their state and
+  # measures them, and run-probe.wasm under wasmtime.
   report = pkgs.callPackage ./nix/measure.nix {
     inherit
       wasi
@@ -58,8 +58,8 @@ in
     lean-canister-report = report;
   };
 
-  # The report fails to build if a module does not install, or a reply or a probe's result is
-  # wrong.
+  # The report fails to build if a module does not install or upgrade, or a reply, a probe's
+  # result or the state is wrong.
   checks = lib.optionalAttrs (pocket-ic != null) {
     lean-canister-runs = report;
   };

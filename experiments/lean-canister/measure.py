@@ -1,4 +1,5 @@
-"""Installs the Lean canister in PocketIC, checks its replies, and measures its instructions.
+"""Installs the Lean canister in PocketIC, checks its replies and its state, and measures its
+instructions.
 
 Usage: measure.py [--pocket-ic BIN] --hello FILE --hello-a-b FILE [--wasmtime BIN]
                   [--run-probe WASM] [--native COMMAND] [--about TEXT] [--json FILE] WASM...
@@ -12,24 +13,30 @@ and calls the canister's queries (see Canister.lean):
   which the --hello files have (with no arguments, and with the arguments a and b);
 - probe, for the instructions that each probe takes at growing sizes, until one fails.
 
-Then upgrades each canister to the same module. With --run-probe, also runs the recursion probes
+Then upgrades each canister to the same module, and tries its state, the notes, with the updates
+add, add_then_exit and add_then_throw and the queries add_query and notes: what an update or a
+reject adds to the notes must stay, and what a query or a trap adds must not. Then upgrades the
+canister again, after which there must be no notes. With --run-probe, also runs the recursion probes
 under wasmtime (default: wasmtime) in that program, RunProbe.lean, for their depths there. With
 --native, which is a command that runs RunProbe.lean natively, such as `lean --run RunProbe.lean`
 with LEAN_PATH set, checks the probe results that have no formula, those of repr, against it.
 
 Prints the report on standard output, and writes the measurements to the --json file. Fails if a
-module does not install, or a reply or a probe's result is wrong.
+module does not install or upgrade, or a reply, a probe's result, the notes or the charge for the
+pages that an update writes are wrong.
 
-The canister logs how many instructions each message takes (c/canister.c), and PocketIC prints
-the canister's log on its standard error. Queries are counted with ic0.performance_counter,
-which includes the System API's charges, such as the one for each 64 KiB page of memory that a
-message touches. Needs pocketic-py 3, which ../../nix/pocket-ic-py.nix provides.
+The canister logs how many instructions each message takes, unless it traps (c/canister.c), and
+PocketIC prints the canister's log on its standard error. Queries and updates are counted with
+ic0.performance_counter, which includes the System API's charges, such as the one for each
+64 KiB page of memory that a message touches, and in an update for each page that it writes.
+Needs pocketic-py 3, which ../../nix/pocket-ic-py.nix provides.
 """
 
 import argparse
 import base64
 import gzip
 import json
+import mmap
 import os
 import re
 import shlex
@@ -73,6 +80,12 @@ RECURSIVE = [name for name, (sizes, _) in PROBES.items() if sizes is DEPTHS]
 
 # The IC's Wasm stack (MAX_WASM_STACK_SIZE in rs/embedders/src/lib.rs).
 WASM_STACK = 5 * 1024 * 1024
+
+# What the IC charges for the first access of a message to a 64 KiB page of Wasm memory, and in an
+# update as much again for its first write to it: page_overhead (DEFAULT_PAGE_OVERHEAD in
+# rs/config/src/subnet_config.rs) for each OS page of it (rs/memory_tracker/src/deterministic.rs).
+# 80,000 with 4 KiB OS pages, 20,000 with macOS's 16 KiB ones.
+PAGE_CHARGE = 5_000 * 65_536 // mmap.PAGESIZE
 
 
 class Server:
@@ -225,7 +238,7 @@ INSTALL_CODE_ARG = Types.Record({
 
 # What c/canister.c logs at the end of each entry point.
 ENTRY_LINE = re.compile(
-    r"(canister_init|canister_post_upgrade|canister_query \w+): (\d+) instructions,"
+    r"(canister_init|canister_post_upgrade|canister_(?:query|update) \w+): (\d+) instructions,"
     r" (\d+) ic0\.time calls(?: \((.*)\))?"
 )
 
@@ -302,7 +315,7 @@ class Canister:
         self.expect_reply(result)
         rounds = {
             "refused tries": refused,
-            # Counted from the round of the last install_code.
+            # Counted from the last round before this call: for the first upgrade, the install's.
             "refusing rounds": tried - start,
             "accepted in round": tried - start + 1,
             # More than one if the IC splits it into slices (deterministic time slicing).
@@ -321,15 +334,24 @@ class Canister:
         return {"log": lines, **measured, **rounds, "replica": replica}
 
     def query(self, method, arg):
+        return self._method("query", method, arg)
+
+    def update(self, method, arg):
+        """An update call, which pocketic-py makes by executing rounds until it is done."""
+        return self._method("update", method, arg)
+
+    def _method(self, kind, method, arg):
         payload = arg if isinstance(arg, bytes) else arg.encode()
+        make_call = self.pic.query_call if kind == "query" else self.pic.update_call
         result, lines, measured = self._entry(
-            lambda: self.pic.query_call(self.id, method, payload), f"canister_query {method}"
+            lambda: make_call(self.id, method, payload), f"canister_{kind} {method}"
         )
-        kind, value = result
+        outcome, value = result
         return {
-            "reply": value.decode() if kind == "reply" else None,
-            "reject": None if kind == "reply" else value["reject_message"],
-            "error_code": None if kind == "reply" else value["error_code"],
+            "reply": value.decode() if outcome == "reply" else None,
+            "reject": None if outcome == "reply" else value["reject_message"],
+            "reject_code": None if outcome == "reply" else value["reject_code"],
+            "error_code": None if outcome == "reply" else value["error_code"],
             "log": lines,
             **(measured or {}),
         }
@@ -418,9 +440,87 @@ def measure(canister, expected_hello):
     # After the upgrade, the canister runs canister_post_upgrade, in new memory.
     out["upgrade"] = canister.install("upgrade")
     check(not out["upgrade"]["log"], f"{canister.name}: canister_post_upgrade logged {out['upgrade']['log']}")
+    check_initialized(canister, out, "upgrade")
     out["queries"]["greet upgraded"] = q = canister.query("greet", "upgraded")
     check(q["reply"] == "Hello, upgraded!", f"greet after the upgrade: {q}")
+    measure_state(canister, out)
     return out
+
+
+def check_initialized(canister, out, upgrade):
+    """canister_post_upgrade starts with new memory, as canister_init does, and runs the same
+    initializers, so it takes as many instructions, part by part. One that skipped Canister.lean's
+    initializer, which creates the notes, would take fewer, and the notes' reference would be a
+    null pointer, which reads as an empty array: the address 0 is in the C stack, and readable."""
+    for part in ("instructions", "ic0.time calls", "constructors", "runtime", "module initializers"):
+        check(out[upgrade][part] == out["install"][part],
+              f"{canister.name}: {upgrade}: canister_post_upgrade's {part} {out[upgrade][part]},"
+              f" canister_init's {out['install'][part]}")
+
+
+def measure_state(canister, out):
+    """The notes of Canister.lean, which its updates change. Sets out["state"], the calls in their
+    order, with the second upgrade among them; out["write charge"], what add "b" took more as an
+    update than as a query; and out["upgrade again"], the second upgrade.
+
+    The calls come after the first upgrade: an update executes rounds, and the install_code debit
+    goes down by 2 billion at the end of each, so that updates before it would change the rounds
+    that refused it. Each argument is new for its method, as the replica answers a query that it
+    has answered before from its cache, also after an update that trapped, which leaves the
+    canister's version as it was."""
+    steps = out["state"] = []
+
+    def step(kind, method, arg):
+        r = {"call": f'{method} "{arg}"', "kind": kind, **getattr(canister, kind)(method, arg)}
+        steps.append(r)
+        check(not r["log"], f"{canister.name}: {r['call']} logged {r['log']}")
+        return r
+
+    def expect(kind, method, arg, reply):
+        r = step(kind, method, arg)
+        check(r["reply"] == reply, f"{canister.name}: {r['call']}: {r} instead of the reply {reply!r}")
+        return r
+
+    expect("update", "add", "a", "1")
+    # add "b" below runs the same code with the same argument, from the same memory: the IC
+    # discards what the queries in between change.
+    as_query = expect("query", "add_query", "b", "2")
+    expect("query", "notes", "1", "#[a]")
+    as_update = expect("update", "add", "b", "2")
+    expect("query", "notes", "2", "#[a, b]")
+    # The exit code is the number of notes: the note was added before the trap. Only the gist of
+    # the message is compared, as only canister.wasm's has a backtrace (the module's name section).
+    r = step("update", "add_then_exit", "c")
+    check((r["reject_code"], r["error_code"]) == ("CanisterError", "CanisterCalledTrap")
+          and failure(r["reject"]) == "ic0.trap: exit(3)", f"{canister.name}: {r['call']}: {r}")
+    expect("query", "notes", "3", "#[a, b]")
+    r = step("update", "add_then_throw", "d")
+    check((r["reject_code"], r["error_code"], r["reject"])
+          == ("CanisterReject", "CanisterRejectedMessage", "added d, then threw"),
+          f"{canister.name}: {r['call']}: {r}")
+    expect("query", "notes", "4", "#[a, b, d]")
+
+    # The update pays for the pages that it writes, before c/canister.c reads the counter.
+    difference = as_update["instructions"] - as_query["instructions"]
+    check(difference > 0 and difference % PAGE_CHARGE == 0,
+          f"{canister.name}: add \"b\" took {difference} instructions more as an update than as a query,"
+          f" which is not a positive multiple of {PAGE_CHARGE}")
+    out["write charge"] = {"instructions": difference, "pages": difference // PAGE_CHARGE}
+
+    # A second upgrade, after which there must be no notes: canister_post_upgrade starts with new
+    # memory again. With the old memory, the module initializers would not run again, as their
+    # _G_initialized flags would be set. The first upgrade's instructions were paid off at the
+    # end of its own round.
+    first = out["upgrade"]
+    again = out["upgrade again"] = canister.install("upgrade")
+    check(not again["log"], f"{canister.name}: the second canister_post_upgrade logged {again['log']}")
+    check(again["refused tries"] == 0, f"{canister.name}: the second upgrade was refused {again['refused tries']} times")
+    check_initialized(canister, out, "upgrade again")
+    check(again["replica"]["canister_post_upgrade"] == first["replica"]["canister_post_upgrade"],
+          f"{canister.name}: the replica's count of the second canister_post_upgrade: {again['replica']}")
+    steps.append({"call": "upgrade", "kind": "install_code", "accepted in round": again["accepted in round"],
+                  "instructions": again["instructions"], "ic0.time calls": again["ic0.time calls"]})
+    expect("query", "notes", "5", "#[]")
 
 
 def measure_canisters(server, wasms, expected_hello):
@@ -561,12 +661,13 @@ def report(about, modules, results, wasmtime):
                " parts that canister.c measures: the C++ constructors,"
                " lean_initialize_runtime_module, and initialize_Canister, which runs the"
                " initializers of Canister.lean and its imports. ic0.time calls are those of"
-               " clock_time_get (c/wasi.c). Then an upgrade to the same module, which runs"
+               " clock_time_get (c/wasi.c). Then a first upgrade to the same module, which runs"
                " canister_post_upgrade, tried right after the install and then again until the IC"
                " accepts it: it refuses install_code for a canister"
                " (CanisterInstallCodeRateLimited) until the rounds have paid off the"
                " instructions of its last one. The rounds are counted from the install's, by the"
-               " instance's time.", "  "))
+               " instance's time. The second upgrade came after the updates, in Updates and"
+               " state below.", "  "))
     print()
     rows = []
     for label, get in [
@@ -577,12 +678,13 @@ def report(about, modules, results, wasmtime):
         ("    Lean runtime", lambda r: r["install"]["runtime"]),
         ("    module initializers", lambda r: r["install"]["module initializers"]),
         ("    ic0.time calls", lambda r: r["install"]["ic0.time calls"]),
-        ("rounds that refused the upgrade", lambda r: r["upgrade"]["refusing rounds"]),
+        ("rounds that refused the first upgrade", lambda r: r["upgrade"]["refusing rounds"]),
         ("round that accepted it", lambda r: r["upgrade"]["accepted in round"]),
         ("rounds that it took", lambda r: r["upgrade"]["rounds taken"]),
-        ("install_code (upgrade)", lambda r: r["upgrade"]["replica"]["install_code"]),
+        ("install_code (first upgrade)", lambda r: r["upgrade"]["replica"]["install_code"]),
         ("  canister_post_upgrade (replica)", lambda r: r["upgrade"]["replica"]["canister_post_upgrade"]),
         ("  canister_post_upgrade", lambda r: r["upgrade"]["instructions"]),
+        ("install_code (second upgrade)", lambda r: r["upgrade again"]["replica"]["install_code"]),
     ]:
         rows.append([label] + [number(get(r)) for r in results])
     table([""] + names, rows)
@@ -595,12 +697,54 @@ def report(about, modules, results, wasmtime):
                " prints natively.", "  "))
     print()
     rows = []
-    for key, label in [("greet world", 'greet "world"'), ("greet upgraded", 'greet "upgraded" (after the upgrade)'),
+    for key, label in [("greet world", 'greet "world"'), ("greet upgraded", 'greet "upgraded" (after the first upgrade)'),
                        ("hello", 'hello ""'), ("hello a b", 'hello "a b"'),
                        ("greet 0xff", "greet 0xff (rejected: not UTF-8)"),
                        ("probe nosuch 1", 'probe "nosuch 1" (rejected)')]:
         rows.append([label] + [number(r["queries"][key].get("instructions")) for r in results])
     table(["query"] + names, rows)
+
+    heading("Updates and state")
+    print(fill("The notes of Canister.lean, an IO.Ref (Array String) that its initialize creates in"
+               " canister_init and canister_post_upgrade, tried after the first upgrade, as"
+               " updates execute rounds, which would have paid off the install's instructions"
+               " before it. The methods: add adds its argument to the notes and replies with how"
+               " many there are, add_query is add as a query, add_then_exit adds and then exits"
+               " with that number, which traps, add_then_throw adds and then throws, which"
+               " rejects, and notes replies with the notes. The table has the calls in their"
+               " order, with the second upgrade, which the IC accepted at once. Every reply and"
+               " reject is checked, and each canister_post_upgrade against canister_init, part by"
+               " part, as they run the same initializers in new memory. Instructions as"
+               " c/canister.c logs them, as for the queries above; a call that traps logs none.",
+               "  "))
+    print()
+    rows = []
+    for i, step in enumerate(results[0]["state"]):
+        if step["kind"] == "install_code":
+            accepted = step["accepted in round"]
+            label = "second upgrade (canister_post_upgrade)"
+            outcome = "accepted at once" if accepted == 1 else f"accepted in round {accepted}"
+        else:
+            label = f"{step['call']} ({step['kind']})"
+            if step["reply"] is not None:
+                outcome = step["reply"]
+            elif step["error_code"] == "CanisterRejectedMessage":
+                outcome = f"rejected: {step['reject']}"
+            else:
+                outcome = f"trapped: {failure(step['reject'])}"
+        times = [r["state"][i].get("ic0.time calls") for r in results]
+        rows.append([label, outcome] + [number(r["state"][i].get("instructions")) for r in results]
+                    + [" / ".join(map(number, times)) if len(set(times)) > 1 else number(times[0])])
+    table(["call", "reply or outcome"] + names + ["ic0.time calls"], rows, text=(0, 1))
+    print()
+    charges = "; ".join(f"{r['module']} {number(r['write charge']['instructions'])}, that is"
+                        f" {r['write charge']['pages']} pages" for r in results)
+    print(fill('add "b" took more instructions as an update than add_query "b", the same code with'
+               " the same argument from the same memory, as a query. The IC charges an update"
+               f" another {number(PAGE_CHARGE)} for each 64 KiB page that it writes, on top of the"
+               " same for the first access, which a query pays too: here for the pages that it"
+               f" wrote before c/canister.c read the counter. {charges}. The difference is"
+               " checked to be a multiple of the charge.", "  "))
 
     heading("Limits")
     text = ("The largest size at which each probe worked, and why it failed at the next size:"

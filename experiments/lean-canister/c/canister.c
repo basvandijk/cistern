@@ -1,14 +1,16 @@
 /*
 The canister's entry points: the exported functions that the IC calls.
 
-canister_init and canister_post_upgrade initialize Lean: an upgrade starts with new memory. The
-query methods are the functions that Canister.lean exports, which reply or reject; they catch
-Lean's errors themselves.
+canister_init and canister_post_upgrade initialize Lean: an upgrade starts with new memory. That
+also creates the notes, the state of Canister.lean. The query and update methods are the
+functions that Canister.lean exports, which reply or reject; they catch Lean's errors themselves.
+add_then_exit traps instead, as exit() calls wasi.c's proc_exit.
 
-Each entry point ends by writing to the canister's log how many instructions its message has
-taken (ic0.performance_counter), and how many ic0.time calls clock_time_get has made for it (see
-wasi.c). The harness, measure.py, reads the log to learn what a message costs. The count cannot
-include the logging itself, which takes some thousand instructions more.
+Each entry point that returns ends by writing to the canister's log how many instructions its
+message has taken (ic0.performance_counter), and how many ic0.time calls clock_time_get has made
+for it (see wasi.c); one that traps logs no count. The harness, measure.py, reads the log to learn
+what a message costs. The count cannot include the logging itself, which takes some thousand
+instructions more.
 */
 #include <inttypes.h>
 #include <stdio.h>
@@ -29,6 +31,10 @@ lean_object * initialize_Canister(uint8_t builtin);
 lean_object * cistern_greet(void);
 lean_object * cistern_hello(void);
 lean_object * cistern_probe(void);
+lean_object * cistern_add(void);
+lean_object * cistern_add_then_exit(void);
+lean_object * cistern_add_then_throw(void);
+lean_object * cistern_notes(void);
 
 /* Ends an entry point. Hands what stdout has buffered (it is line buffered, so at most part of a
    line) and the rest of any line to the log, then logs
@@ -60,6 +66,7 @@ static void initialize(char const * entry) {
     lean_initialize_runtime_module();
     uint64_t runtime = ic0_performance_counter(0);
     // The initializers of Canister.lean and its imports: Hello, Ic0, Probes and all of Init.
+    // Canister.lean's `initialize` creates the notes.
     lean_object * res = initialize_Canister(1 /* builtin */);
     if (lean_io_result_is_error(res)) {
         lean_io_result_show_error(res); // "uncaught exception: ..." to stderr
@@ -83,21 +90,46 @@ __attribute__((export_name("canister_post_upgrade"))) void canister_post_upgrade
     initialize("canister_post_upgrade");
 }
 
-/* A query of Canister.lean: a `BaseIO Unit`, which returns lean_box(0). */
-static void query(char const * entry, lean_object * (*serve)(void)) {
+/* A query or an update of Canister.lean: a `BaseIO Unit`, which returns lean_box(0). */
+static void serve(char const * entry, lean_object * (*method)(void)) {
     unsigned long time_calls = wasi_ic0_time_calls;
-    serve();
+    method();
     finish(entry, time_calls, "");
 }
 
 __attribute__((export_name("canister_query greet"))) void canister_query_greet(void) {
-    query("canister_query greet", cistern_greet);
+    serve("canister_query greet", cistern_greet);
 }
 
 __attribute__((export_name("canister_query hello"))) void canister_query_hello(void) {
-    query("canister_query hello", cistern_hello);
+    serve("canister_query hello", cistern_hello);
 }
 
 __attribute__((export_name("canister_query probe"))) void canister_query_probe(void) {
-    query("canister_query probe", cistern_probe);
+    serve("canister_query probe", cistern_probe);
+}
+
+__attribute__((export_name("canister_update add"))) void canister_update_add(void) {
+    serve("canister_update add", cistern_add);
+}
+
+/* add as a query, whose changes the IC discards. It needs a name of its own: the IC refuses a
+   module that exports the same name as a query and as an update (DuplicateExport in
+   rs/embedders/src/wasm_utils/validation.rs). */
+__attribute__((export_name("canister_query add_query"))) void canister_query_add_query(void) {
+    serve("canister_query add_query", cistern_add);
+}
+
+__attribute__((export_name("canister_update add_then_exit")))
+void canister_update_add_then_exit(void) {
+    serve("canister_update add_then_exit", cistern_add_then_exit);
+}
+
+__attribute__((export_name("canister_update add_then_throw")))
+void canister_update_add_then_throw(void) {
+    serve("canister_update add_then_throw", cistern_add_then_throw);
+}
+
+__attribute__((export_name("canister_query notes"))) void canister_query_notes(void) {
+    serve("canister_query notes", cistern_notes);
 }
