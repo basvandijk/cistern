@@ -1,0 +1,34 @@
+# CI: builds the flake's Linux checks on nixbuild.net, with nixbuild.net's reusable workflow
+# (https://github.com/nixbuild/nixbuild-action#using-the-ci-workflow). Its first job evaluates
+# the flake on the runner and starts one job per check, which builds the check on nixbuild.net.
+# nixbuild.net keeps what it built, for CI or for a developer's Nix, so a check that was built
+# there before is not built again.
+#
+# Not the aarch64-darwin checks: nixbuild.net builds only for x86_64-linux and aarch64-linux.
+# Nor the packages, though no check builds lean-wasm-report, nor on aarch64-linux the canister.
+# The secret NIXBUILD_TOKEN is a nixbuild.net auth token with the permissions build:read,
+# build:write, store:read and store:write.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # A push to a pull request cancels the run for its previous push; runs on master all finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    # v27, by its commit, as the workflow gets the token (its own actions are pinned by tag).
+    uses: nixbuild/nixbuild-action/.github/workflows/ci-workflow.yml@ccd11ee76c26c018e8470835dc2e286a5a024a14 # v27
+    secrets:
+      nixbuild_token: ${{ secrets.NIXBUILD_TOKEN }}
+    with:
+      filter_builds: '.top_attr == "checks" and (.system | endswith("-linux"))'
