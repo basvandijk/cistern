@@ -279,7 +279,8 @@ the rest of the runtime does not recompile Init. The configuration is minimal:
   puts the 8 bytes of a scalar field of a static object into a single pointer, which has only 4
   bytes on wasm32. So the object comes out a slot short and the field loses half its bytes,
   without a warning from clang, even with `-Wall -Wextra`. This corrupts, for example, the
-  hashes in name literals. It is worth reporting upstream.
+  hashes in name literals. It is reported upstream as
+  [lean4#15814](https://github.com/leanprover/lean4/issues/15814).
 - **[runtime/string-to-list.patch](runtime/string-to-list.patch)**: `String.toList`
   (`lean_string_data`) ends the list that it builds with `lean_box_uint32(0)` instead of
   `lean_box(0)`, which is `[]`. On a 64-bit target the two are the same, but on a 32-bit one
@@ -287,7 +288,11 @@ the rest of the runtime does not recompile Init. The configuration is minimal:
   for `[]`, as its tag is 0, but `String.ofList` (`lean_string_mk`) looks for the end of the list
   with `lean_is_scalar`, and reads past it: `String.ofList s.toList` gets a character 0 at the
   end, or crashes. The tests of the [Candid library](../../candid) found it, through `List.take`,
-  which returns the list itself if it is shorter than asked. This is worth reporting upstream too.
+  which returns the list itself if it is shorter than asked. It had already been reported
+  upstream ([lean4#15530](https://github.com/leanprover/lean4/issues/15530)). Lean 4.36.0-rc1
+  fixes it by implementing `String.toList` in Lean
+  ([lean4#15533](https://github.com/leanprover/lean4/pull/15533)), so with that version the
+  patch is no longer needed, and no longer applies.
 - **[runtime/wasi.patch](runtime/wasi.patch)** has 16 small hunks. Two of them matter beyond
   making the build work:
   - `IO.getRandomBytes` uses `getentropy` (WASI's `random_get`). WASI has no `/dev/urandom`,
