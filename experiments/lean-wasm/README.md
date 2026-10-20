@@ -280,6 +280,14 @@ the rest of the runtime does not recompile Init. The configuration is minimal:
   bytes on wasm32. So the object comes out a slot short and the field loses half its bytes,
   without a warning from clang, even with `-Wall -Wextra`. This corrupts, for example, the
   hashes in name literals. It is worth reporting upstream.
+- **[runtime/string-to-list.patch](runtime/string-to-list.patch)**: `String.toList`
+  (`lean_string_data`) ends the list that it builds with `lean_box_uint32(0)` instead of
+  `lean_box(0)`, which is `[]`. On a 64-bit target the two are the same, but on a 32-bit one
+  `lean_box_uint32` puts the number in an object on the heap. Lean code still takes that object
+  for `[]`, as its tag is 0, but `String.ofList` (`lean_string_mk`) looks for the end of the list
+  with `lean_is_scalar`, and reads past it: `String.ofList s.toList` gets a character 0 at the
+  end, or crashes. The tests of the [Candid library](../../candid) found it, through `List.take`,
+  which returns the list itself if it is shorter than asked. This is worth reporting upstream too.
 - **[runtime/wasi.patch](runtime/wasi.patch)** has 16 small hunks. Two of them matter beyond
   making the build work:
   - `IO.getRandomBytes` uses `getentropy` (WASI's `random_get`). WASI has no `/dev/urandom`,

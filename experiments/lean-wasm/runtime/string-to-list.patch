@@ -1,0 +1,11 @@
+--- a/src/runtime/object.cpp
++++ b/src/runtime/object.cpp
+@@ -2199,7 +2199,7 @@
+     utf8_decode(s, tmp);
+     if (reverse)
+         std::reverse(tmp.begin(), tmp.end());
+-    obj_res  r = lean_box_uint32(0);
++    obj_res  r = lean_box(0);
+     unsigned i = tmp.size();
+     while (i > 0) {
+         --i;

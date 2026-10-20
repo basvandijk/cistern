@@ -104,7 +104,10 @@ wasi.stdenv.mkDerivation {
     runHook postUnpack
   '';
 
-  patches = [ ../runtime/wasi.patch ];
+  patches = [
+    ../runtime/wasi.patch
+    ../runtime/string-to-list.patch
+  ];
 
   postPatch = ''
     substitute ${lean4.src}/src/githash.h.in src/githash.h --replace-fail "@GIT_SHA1@" ""
