@@ -1,0 +1,10 @@
+service : {
+  add : (text) -> (nat);
+  add_query : (text) -> (nat) query;
+  add_then_exit : (text) -> ();
+  add_then_throw : (text) -> ();
+  greet : (text) -> (text) query;
+  hello : (vec text) -> (text) query;
+  notes : (text) -> (vec text) query;
+  probe : (text, nat, opt nat) -> (record { result : nat; instructions : vec nat64 }) query;
+}

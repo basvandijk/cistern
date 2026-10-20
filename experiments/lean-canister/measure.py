@@ -1,7 +1,7 @@
 """Installs the Lean canister in PocketIC, checks its replies and its state, and measures its
 instructions.
 
-Usage: measure.py [--pocket-ic BIN] --hello FILE --hello-a-b FILE [--wasmtime BIN]
+Usage: measure.py [--pocket-ic BIN] --did FILE --hello FILE --hello-a-b FILE [--wasmtime BIN]
                   [--run-probe WASM] [--native COMMAND] [--about TEXT] [--json FILE] WASM...
 
 Starts a PocketIC server, which BIN runs (default: pocket-ic), and uses it with pocketic-py, its
@@ -11,7 +11,16 @@ and calls the canister's queries (see Canister.lean):
 
 - greet and hello, whose replies must be "Hello, world!" and what Hello.lean prints natively,
   which the --hello files have (with no arguments, and with the arguments a and b);
+- greet with arguments that are not what it takes: not Candid, a nat instead of a text, a text
+  that is not UTF-8, no argument, which the canister must reject with its decoder's error, and an
+  extra argument, which it must ignore;
+- probe without its last argument, an opt nat, which the decoder must make null;
 - probe, for the instructions that each probe takes at growing sizes, until one fails.
+
+Arguments and replies are Candid, of the types of the canister's interface, the --did file
+(canister.did), which ic-py, the Python library that pocketic-py uses, parses. ic-py encodes the
+arguments and decodes the replies, and checks that a method is a query in the interface if and
+only if it is called as one.
 
 Then upgrades each canister to the same module, and tries its state, the notes, with the updates
 add, add_then_exit and add_then_throw and the queries add_query and notes: what an update or a
@@ -50,7 +59,9 @@ import time
 from pathlib import Path
 
 import ic
+from antlr4 import CommonTokenStream, InputStream, ParseTreeWalker
 from ic.candid import Types
+from ic.parser.DIDEmitter import DIDEmitter, DIDLexer, DIDParser
 from pocket_ic import PocketIC, SubnetConfig
 
 # The 1-2-5 series of ../lean-wasm/README.md, for the recursion depth.
@@ -236,6 +247,27 @@ INSTALL_CODE_ARG = Types.Record({
     "arg": Types.Vec(Types.Nat8),
 })
 
+def interface(did):
+    """The methods of a service's Candid interface, the text of a .did file, by name: ic-py's
+    function types, with argTypes, retTypes and annotations (such as ["query"]). Parsed as ic-py's
+    Canister class does (ic/canister.py), without an agent."""
+    parser = DIDParser(CommonTokenStream(DIDLexer(InputStream(did))))
+    emitter = DIDEmitter()
+    ParseTreeWalker().walk(emitter, parser.program())
+    return emitter.getActor()["methods"]
+
+
+# The messages with which the canister rejects the arguments that greet does not take: those of
+# the decoder of the Candid library (../../candid/Candid/Decode.lean), which serve in
+# Canister.lean passes on. They start with "Candid:".
+REJECTS = {
+    "not Candid": "Candid: wrong magic at byte 0",
+    "nat": "Candid: nat cannot be deserialized to text at byte 7",
+    "not UTF-8": "Candid: invalid utf8 at byte 7",
+    "no argument": "Candid: No more values on the wire, the expected type text is not opt, null,"
+                   " or reserved at byte 6",
+}
+
 # What c/canister.c logs at the end of each entry point.
 ENTRY_LINE = re.compile(
     r"(canister_init|canister_post_upgrade|canister_(?:query|update) \w+): (\d+) instructions,"
@@ -244,8 +276,8 @@ ENTRY_LINE = re.compile(
 
 
 class Canister:
-    def __init__(self, server, pic, wasm):
-        self.server, self.pic, self.name = server, pic, Path(wasm).name
+    def __init__(self, server, pic, wasm, methods):
+        self.server, self.pic, self.name, self.methods = server, pic, Path(wasm).name, methods
         self.module = Path(wasm).read_bytes()
         self.id = pic.create_canister()
         self.text_id = self.id.to_str()
@@ -290,12 +322,15 @@ class Canister:
         The IC charges the instructions of an install_code to the canister, and refuses the
         next until the rounds have paid them off, at 2 billion per round. So this tries again
         until the IC accepts. pocketic-py executes rounds until a call is done, and the rounds
-        are counted by the instance's time."""
+        are counted by the instance's time.
+
+        The canister's own argument is the empty Candid sequence, (), as dfx sends for a canister
+        that takes no init arguments. canister_init does not decode it."""
         arg = ic.encode([{"type": INSTALL_CODE_ARG, "value": {
             "mode": {mode: None},
             "canister_id": self.id.bytes,
             "wasm_module": gzip.compress(self.module, 9, mtime=0),
-            "arg": b"",
+            "arg": ic.encode([]),
         }}])
         # The management canister routes the call by the canister id in its argument.
         effective = {"CanisterId": base64.b64encode(self.id.bytes).decode()}
@@ -333,22 +368,39 @@ class Canister:
         check(len(replica) == 2, f"{self.name}: the replica's log of the install is {replica}")
         return {"log": lines, **measured, **rounds, "replica": replica}
 
-    def query(self, method, arg):
-        return self._method("query", method, arg)
+    def query(self, method, args):
+        return self._method("query", method, args)
 
-    def update(self, method, arg):
+    def update(self, method, args):
         """An update call, which pocketic-py makes by executing rounds until it is done."""
-        return self._method("update", method, arg)
+        return self._method("update", method, args)
 
-    def _method(self, kind, method, arg):
-        payload = arg if isinstance(arg, bytes) else arg.encode()
+    def _method(self, kind, method, args):
+        """Calls the method with `args`, a list of Python values of its argument types in the
+        interface, which ic-py encodes, or bytes, which are sent as they are. The reply is
+        decoded at the method's result types: the value of the result if there is one, such as
+        a str for a text, an int for a nat, a list for a vec and a dict by field name for a
+        record, and None if there is none."""
+        func = self.methods[method]
+        check(("query" in func.annotations) == (kind == "query"),
+              f"{method} is called as {kind}, but its type is {func.annotations}")
+        if isinstance(args, bytes):
+            payload = args
+        else:
+            payload = ic.encode([{"type": t, "value": v}
+                                 for t, v in zip(func.argTypes, args, strict=True)])
         make_call = self.pic.query_call if kind == "query" else self.pic.update_call
         result, lines, measured = self._entry(
             lambda: make_call(self.id, method, payload), f"canister_{kind} {method}"
         )
         outcome, value = result
+        reply = None
+        if outcome == "reply":
+            values = [item["value"] for item in ic.decode(value, func.retTypes)]
+            check(len(values) == len(func.retTypes), f"{method}: the reply {value!r} has {values}")
+            reply = values[0] if len(values) == 1 else values or None
         return {
-            "reply": value.decode() if outcome == "reply" else None,
+            "reply": reply,
             "reject": None if outcome == "reply" else value["reject_message"],
             "reject_code": None if outcome == "reply" else value["reject_code"],
             "error_code": None if outcome == "reply" else value["error_code"],
@@ -394,19 +446,36 @@ def measure(canister, expected_hello):
     out = {"module": canister.name, "canister": canister.text_id, "install": canister.install("install")}
     check(not out["install"]["log"], f"{canister.name}: canister_init logged {out['install']['log']}")
 
+    # Each argument is new for its method: the replica answers a query that it has answered
+    # before from its cache, without executing it.
     queries = out["queries"] = {
-        "greet world": canister.query("greet", "world"),
-        "greet 0xff": canister.query("greet", b"\xff"),
-        "hello": canister.query("hello", ""),
-        "hello a b": canister.query("hello", "a b"),
-        "probe nosuch 1": canister.query("probe", "nosuch 1"),
+        "greet world": canister.query("greet", ["world"]),
+        "greet not Candid": canister.query("greet", b"\xff"),
+        "greet nat": canister.query("greet", ic.encode([{"type": Types.Nat, "value": 1}])),
+        # The text 0xff, which is not UTF-8.
+        "greet not UTF-8": canister.query("greet", b"DIDL\x00\x01\x71\x01\xff"),
+        "greet no argument": canister.query("greet", ic.encode([])),
+        "greet extra": canister.query("greet", ic.encode([{"type": Types.Text, "value": "extra"},
+                                                          {"type": Types.Nat, "value": 1}])),
+        "hello": canister.query("hello", [[]]),
+        "hello a b": canister.query("hello", [["a", "b"]]),
+        "probe nosuch 1": canister.query("probe", ["nosuch", 1, []]),
+        # Without the third argument, an opt nat, which the decoder makes null: one run.
+        "probe noop 0": canister.query("probe", ic.encode([{"type": Types.Text, "value": "noop"},
+                                                           {"type": Types.Nat, "value": 0}])),
     }
     check(queries["greet world"]["reply"] == "Hello, world!", f"greet: {queries['greet world']}")
     check(queries["greet world"]["log"] == ["greeting world"], f"greet's log: {queries['greet world']}")
-    check(queries["greet 0xff"]["reject"] == "the argument is not UTF-8", f"greet: {queries['greet 0xff']}")
+    for what, message in REJECTS.items():
+        q = queries[f"greet {what}"]
+        check(q["reject"] == message, f"greet {what}: {q} instead of the reject {message!r}")
+    check(queries["greet extra"]["reply"] == "Hello, extra!", f"greet extra: {queries['greet extra']}")
     for key, expected in expected_hello.items():
         check(queries[key]["reply"] == expected, f"{key}: {queries[key]['reply']!r} instead of {expected!r}")
     check(queries["probe nosuch 1"]["reject"] == "there is no probe nosuch", f"probe: {queries['probe nosuch 1']}")
+    q = queries["probe noop 0"]
+    check(q["reply"] is not None and q["reply"]["result"] == 0 and len(q["reply"]["instructions"]) == 1,
+          f"probe noop 0 without its third argument: {q}")
 
     # Each probe at growing sizes, until it fails, and then the largest size that works, by
     # bisection. Each argument is new: the replica answers a query that it has answered before
@@ -415,12 +484,12 @@ def measure(canister, expected_hello):
     for name, (sizes, _) in PROBES.items():
 
         def probe(n):
-            q = canister.query("probe", f"{name} {n}")
+            q = canister.query("probe", [name, n, []])
             run = {"n": n, "total": q.get("instructions")}
             if q["reply"] is None:
                 run["failure"] = q["reject"]
             else:
-                reply = json.loads(q["reply"])
+                reply = q["reply"]
                 check_result(canister.name, name, n, reply["result"])
                 run.update(result=reply["result"], instructions=reply["instructions"][0])
             return run
@@ -431,9 +500,9 @@ def measure(canister, expected_hello):
 
     out["twice"] = {}
     for name, n in TWICE.items():
-        q = canister.query("probe", f"{name} {n} 2")
+        q = canister.query("probe", [name, n, [2]])
         check(q["reply"] is not None, f"probe {name} {n} 2: {q}")
-        reply = json.loads(q["reply"])
+        reply = q["reply"]
         check_result(canister.name, name, n, reply["result"])
         out["twice"][name] = {"n": n, "result": reply["result"], "instructions": reply["instructions"]}
 
@@ -441,7 +510,7 @@ def measure(canister, expected_hello):
     out["upgrade"] = canister.install("upgrade")
     check(not out["upgrade"]["log"], f"{canister.name}: canister_post_upgrade logged {out['upgrade']['log']}")
     check_initialized(canister, out, "upgrade")
-    out["queries"]["greet upgraded"] = q = canister.query("greet", "upgraded")
+    out["queries"]["greet upgraded"] = q = canister.query("greet", ["upgraded"])
     check(q["reply"] == "Hello, upgraded!", f"greet after the upgrade: {q}")
     measure_state(canister, out)
     return out
@@ -460,7 +529,7 @@ def check_initialized(canister, out, upgrade):
 
 def measure_state(canister, out):
     """The notes of Canister.lean, which its updates change. Sets out["state"], the calls in their
-    order, with the second upgrade among them; out["write charge"], what add "b" took more as an
+    order, with the second upgrade among them; out["write charge"], what add ("b") took more as an
     update than as a query; and out["upgrade again"], the second upgrade.
 
     The calls come after the first upgrade: an update executes rounds, and the install_code debit
@@ -471,7 +540,8 @@ def measure_state(canister, out):
     steps = out["state"] = []
 
     def step(kind, method, arg):
-        r = {"call": f'{method} "{arg}"', "kind": kind, **getattr(canister, kind)(method, arg)}
+        r = {"call": f"{method} ({candid_text(arg)})", "kind": kind,
+             **getattr(canister, kind)(method, [arg])}
         steps.append(r)
         check(not r["log"], f"{canister.name}: {r['call']} logged {r['log']}")
         return r
@@ -481,24 +551,24 @@ def measure_state(canister, out):
         check(r["reply"] == reply, f"{canister.name}: {r['call']}: {r} instead of the reply {reply!r}")
         return r
 
-    expect("update", "add", "a", "1")
-    # add "b" below runs the same code with the same argument, from the same memory: the IC
+    expect("update", "add", "a", 1)
+    # add ("b") below runs the same code with the same argument, from the same memory: the IC
     # discards what the queries in between change.
-    as_query = expect("query", "add_query", "b", "2")
-    expect("query", "notes", "1", "#[a]")
-    as_update = expect("update", "add", "b", "2")
-    expect("query", "notes", "2", "#[a, b]")
+    as_query = expect("query", "add_query", "b", 2)
+    expect("query", "notes", "1", ["a"])
+    as_update = expect("update", "add", "b", 2)
+    expect("query", "notes", "2", ["a", "b"])
     # The exit code is the number of notes: the note was added before the trap. Only the gist of
     # the message is compared, as only canister.wasm's has a backtrace (the module's name section).
     r = step("update", "add_then_exit", "c")
     check((r["reject_code"], r["error_code"]) == ("CanisterError", "CanisterCalledTrap")
           and failure(r["reject"]) == "ic0.trap: exit(3)", f"{canister.name}: {r['call']}: {r}")
-    expect("query", "notes", "3", "#[a, b]")
+    expect("query", "notes", "3", ["a", "b"])
     r = step("update", "add_then_throw", "d")
     check((r["reject_code"], r["error_code"], r["reject"])
           == ("CanisterReject", "CanisterRejectedMessage", "added d, then threw"),
           f"{canister.name}: {r['call']}: {r}")
-    expect("query", "notes", "4", "#[a, b, d]")
+    expect("query", "notes", "4", ["a", "b", "d"])
 
     # The update pays for the pages that it writes, before c/canister.c reads the counter.
     difference = as_update["instructions"] - as_query["instructions"]
@@ -520,13 +590,13 @@ def measure_state(canister, out):
           f"{canister.name}: the replica's count of the second canister_post_upgrade: {again['replica']}")
     steps.append({"call": "upgrade", "kind": "install_code", "accepted in round": again["accepted in round"],
                   "instructions": again["instructions"], "ic0.time calls": again["ic0.time calls"]})
-    expect("query", "notes", "5", "#[]")
+    expect("query", "notes", "5", [])
 
 
-def measure_canisters(server, wasms, expected_hello):
+def measure_canisters(server, wasms, methods, expected_hello):
     """Each module in a canister of its own, in one instance, which this deletes at the end."""
     pic = pocket_ic(server)
-    canisters = [Canister(server, pic, wasm) for wasm in wasms]
+    canisters = [Canister(server, pic, wasm, methods) for wasm in wasms]
     results = [measure(c, expected_hello) for c in canisters]
     pic.server.delete_instance(pic.instance_id)
     return results
@@ -628,6 +698,22 @@ def number(n):
     return "" if n is None else f"{n:,}"
 
 
+def candid_text(value):
+    """A value as ic-py decodes it, in Candid's text format, as far as the replies here need it:
+    text, nat, vec and record (ic-py's opt, a list of zero or one values, does not occur)."""
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, list):
+        return "vec { " + "; ".join(map(candid_text, value)) + " }" if value else "vec {}"
+    if isinstance(value, dict):
+        return "record { " + "; ".join(f"{k} = {candid_text(v)}" for k, v in value.items()) + " }"
+    if value is None:
+        return "()"
+    raise TypeError(f"no Candid text for {value!r}")
+
+
 def failure(message):
     """The gist of a reject message, as the replica phrases it."""
     for pattern, gist in [
@@ -693,15 +779,24 @@ def report(about, modules, results, wasmtime):
     heading("Queries")
     print(fill("Instructions of each query up to its end, as c/canister.c logs them there; the"
                " logging itself takes some thousand more, which the count cannot include (for"
-               " canister_init, the difference to the replica's count above). The replies are"
-               " checked: greet's against \"Hello, <argument>!\", hello's against what Hello.lean"
-               " prints natively.", "  "))
+               " canister_init, the difference to the replica's count above). Arguments and"
+               " replies are Candid, encoded and decoded by ic-py with the types of canister.did;"
+               " the arguments below are in Candid's text format. The replies are checked:"
+               " greet's against \"Hello, <argument>!\", hello's against what Hello.lean prints"
+               " natively, and the rejects against the decoder's messages (Canister.lean's serve"
+               " rejects a message whose argument it cannot decode). An extra argument is"
+               " ignored, and a missing opt argument is null.", "  "))
     print()
     rows = []
-    for key, label in [("greet world", 'greet "world"'), ("greet upgraded", 'greet "upgraded" (after the first upgrade)'),
-                       ("hello", 'hello ""'), ("hello a b", 'hello "a b"'),
-                       ("greet 0xff", "greet 0xff (rejected: not UTF-8)"),
-                       ("probe nosuch 1", 'probe "nosuch 1" (rejected)')]:
+    for key, label in [("greet world", 'greet ("world")'), ("greet upgraded", 'greet ("upgraded") (after the first upgrade)'),
+                       ("greet extra", 'greet ("extra", 1) (an extra argument)'),
+                       ("greet not Candid", "greet 0xff (rejected: not Candid)"),
+                       ("greet nat", "greet (1) (rejected: a nat, not a text)"),
+                       ("greet not UTF-8", "greet with a text 0xff (rejected: not UTF-8)"),
+                       ("greet no argument", "greet () (rejected: no argument)"),
+                       ("hello", "hello (vec {})"), ("hello a b", 'hello (vec { "a"; "b" })'),
+                       ("probe nosuch 1", 'probe ("nosuch", 1, null) (rejected)'),
+                       ("probe noop 0", 'probe ("noop", 0) (no third argument)')]:
         rows.append([label] + [number(r["queries"][key].get("instructions")) for r in results])
     table(["query"] + names, rows)
 
@@ -728,7 +823,7 @@ def report(about, modules, results, wasmtime):
         else:
             label = f"{step['call']} ({step['kind']})"
             if step["reply"] is not None:
-                outcome = step["reply"]
+                outcome = candid_text(step["reply"])
             elif step["error_code"] == "CanisterRejectedMessage":
                 outcome = f"rejected: {step['reject']}"
             else:
@@ -740,8 +835,8 @@ def report(about, modules, results, wasmtime):
     print()
     charges = "; ".join(f"{r['module']} {number(r['write charge']['instructions'])}, that is"
                         f" {r['write charge']['pages']} pages" for r in results)
-    print(fill('add "b" took more instructions as an update than add_query "b", the same code with'
-               " the same argument from the same memory, as a query. The IC charges an update"
+    print(fill('add ("b") took more instructions as an update than add_query ("b"), the same code'
+               " with the same argument from the same memory, as a query. The IC charges an update"
                f" another {number(PAGE_CHARGE)} for each 64 KiB page that it writes, on top of the"
                " same for the first access, which a query pays too: here for the pages that it"
                f" wrote before c/canister.c read the counter. {charges}. The difference is"
@@ -816,6 +911,7 @@ def report(about, modules, results, wasmtime):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--pocket-ic", default="pocket-ic")
+    parser.add_argument("--did", required=True, type=Path)
     parser.add_argument("--hello", required=True, type=Path)
     parser.add_argument("--hello-a-b", required=True, type=Path)
     parser.add_argument("--wasmtime", default="wasmtime")
@@ -826,11 +922,12 @@ def main():
     parser.add_argument("wasm", nargs="+", type=Path)
     args = parser.parse_args()
     expected_hello = {"hello": args.hello.read_text(), "hello a b": args.hello_a_b.read_text()}
+    methods = interface(args.did.read_text())
 
     with tempfile.TemporaryDirectory() as workdir:
         server = Server(args.pocket_ic, workdir)
         try:
-            results = measure_canisters(server, args.wasm, expected_hello)
+            results = measure_canisters(server, args.wasm, methods, expected_hello)
         except Exception:  # not a failed check (SystemExit), or Ctrl-C
             server.show_stderr()
             raise

@@ -7,8 +7,8 @@
 #   canister.wasm).
 #
 # The Lean runtime and Init are those of the lean-wasm experiment, which are built for
-# wasm32-wasip1. Everything is compiled with the runtime's flags; the files in ../c also with
-# warnings as errors.
+# wasm32-wasip1, and the Candid library is `candidWasm`'s libCandid.a. Everything is compiled with
+# the runtime's flags; the files in ../c also with warnings as errors.
 {
   lib,
   binaryen,
@@ -17,6 +17,7 @@
   runtime,
   init,
   canisterC,
+  candidWasm,
 }:
 let
   cflags = lib.escapeShellArgs runtime.cflags;
@@ -32,7 +33,7 @@ wasi.runCommandCC "lean-canister"
   ''
     # Two directories, as Ic0.c and Canister.c differ from ic0.c and canister.c only in case.
     mkdir lean c
-    for module in Hello Ic0 Probes Canister RunProbe; do
+    for module in Hello Ic0 Probes Interface Canister RunProbe; do
       $CC ${cflags} -c ${canisterC}/$module.c -o lean/$module.o
     done
     for file in ic0 wasi canister; do
@@ -43,9 +44,23 @@ wasi.runCommandCC "lean-canister"
     # -mexec-model=reactor: the IC calls neither. canister.c's canister_init runs the C++
     # constructors instead. --no-entry: the exports are those of canister.c (and the memory).
     # --fatal-warnings: wasm-ld only warns about a WASI function in wasi.c with the wrong type.
-    $CC lean/{Hello,Ic0,Probes,Canister}.o c/*.o ${init}/lib/libInit.a ${runtime}/lib/libleanrt.a \
-      ${ldflags} -nostartfiles -Wl,--no-entry -Wl,--fatal-warnings -Wl,-Map=canister.map \
-      -o canister.wasm
+    $CC lean/{Hello,Ic0,Probes,Interface,Canister}.o c/*.o ${candidWasm}/lib/libCandid.a \
+      ${init}/lib/libInit.a ${runtime}/lib/libleanrt.a ${ldflags} -nostartfiles -Wl,--no-entry \
+      -Wl,--fatal-warnings -Wl,-Map=canister.map -o canister.wasm
+
+    # Interface.lean imports Candid.Derive, the deriving handler, with `meta import`, and the
+    # handler imports Lean's own modules, which the link does not have. Only Interface's
+    # initializers of the meta phase (meta_initialize_Interface) and of all phases
+    # (initialize_Interface) refer to them, and nothing calls those: canister.c calls
+    # runtime_initialize_Canister. So wasm-ld drops them, and the link needs no stub for Lean's
+    # modules. Were one of them live, the link would already have failed, on Candid.Derive's
+    # initializers, which no object defines (the library has no C for Candid.Derive); this check,
+    # on the map, which lists the functions that the module has, says so explicitly.
+    grep -q ' runtime_initialize_Canister$' canister.map
+    if grep -E ' (meta_)?initialize_(Canister|Interface|Candid_Derive)$' canister.map; then
+      echo "canister.wasm has an initializer of the meta phase, see above" >&2
+      exit 1
+    fi
 
     # A function that is declared as a Wasm import, such as a WASI function that wasi.c lacks,
     # becomes an import if no object file defines it, without an error from wasm-ld. The IC

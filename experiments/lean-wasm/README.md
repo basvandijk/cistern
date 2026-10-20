@@ -350,9 +350,9 @@ Wasm memory between messages and across an upgrade, but not stable memory or `op
    300 billion and an update call 40 billion [1].
    [PocketIC](https://docs.internetcomputer.org/guides/testing/pocket-ic.md) runs an IC replica
    locally, which makes it the place to measure, and to confirm the recursion depths above,
-   which come from wasmtime with the IC's stack size. In lean-canister, `canister_init` takes
-   2.2 million instructions and the install 3.5 billion, and PocketIC allows more depth than
-   the table above (see [Recursion depth](#recursion-depth)).
+   which come from wasmtime with the IC's stack size. In lean-canister, whose methods speak
+   Candid, `canister_init` takes 3.4 million instructions and the install 5.4 billion, and
+   PocketIC allows more depth than the table above (see [Recursion depth](#recursion-depth)).
 6. **Size.** Size is not a blocker, but Init's runtime initializers keep 0.39 MB of Init in even
    a hello world, 0.32 MB of it the initializers themselves. Init's meta phase, which only the
    compiler needs, is left out, as Hello.lean is a module file: 0.75 MB of code, 66% of the

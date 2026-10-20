@@ -16,6 +16,7 @@
   wasi,
   canister,
   canisterC,
+  did,
 }:
 runCommand "lean-canister-report"
   {
@@ -31,10 +32,12 @@ runCommand "lean-canister-report"
     # measure.py talks to PocketIC on 127.0.0.1, which the macOS sandbox allows only with this.
     __darwinAllowLocalNetworking = true;
     about =
-      "canister.wasm is Canister.lean, which imports Hello.lean, Ic0.lean and Probes.lean, "
-      + "compiled to C by Lean ${lean4.version} and then by clang ${wasi.stdenv.cc.version} to "
-      + "${wasi.stdenv.hostPlatform.config}, together with Lean's Init library and runtime and "
-      + "the C of c/; canister-opt.wasm is the same after `wasm-opt -O`. Measured by measure.py "
+      "canister.wasm is Canister.lean, which imports Hello.lean, Ic0.lean, Probes.lean and "
+      + "Interface.lean, compiled to C by Lean ${lean4.version} and then by clang "
+      + "${wasi.stdenv.cc.version} to ${wasi.stdenv.hostPlatform.config}, together with the "
+      + "Candid library, Lean's Init library and runtime, and the C of c/; canister-opt.wasm is "
+      + "the same after `wasm-opt -O`. Its arguments and replies are Candid, of the types of "
+      + "canister.did, which Interface.lean generates. Measured by measure.py "
       + "in PocketIC ${pocket-ic.version}, through pocketic-py ${pocket-ic-py.pocket-ic.version}, "
       + "on one application subnet with the IC's production limits, on "
       + "${stdenv.hostPlatform.system}. run-probe.wasm is RunProbe.lean, which "
@@ -51,7 +54,8 @@ runCommand "lean-canister-report"
     hello=$PWD/hello.txt
     hello_a_b=$PWD/hello-a-b.txt
     cd ${canister}/bin # so that the report names the modules by their file names
-    python3 ${../measure.py} --hello $hello --hello-a-b $hello_a_b --run-probe run-probe.wasm \
+    python3 ${../measure.py} --did ${did}/canister.did --hello $hello --hello-a-b $hello_a_b \
+      --run-probe run-probe.wasm \
       --native "lean --run ${../RunProbe.lean}" --about "$about" --json $out/measurements.json \
       canister.wasm canister-opt.wasm > $out/report.txt
   ''

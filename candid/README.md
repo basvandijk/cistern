@@ -11,6 +11,7 @@ room, the Rust crate `candid` 0.10.38, both at commit 10423fae of dfinity/candid
 467 assertions of the specification's conformance suite. It needs only Lean's `Init`,
 which is what a canister links (see [lean-wasm](../experiments/lean-wasm)), and runs on wasm32
 as on 64-bit platforms; the tests check that it gives the same results on both.
+[lean-canister](../experiments/lean-canister) uses it for its methods' arguments and replies.
 
 ## Using it
 
@@ -76,6 +77,12 @@ reads `Candid: <message> at byte <offset>`, in the Rust crate's words where it h
 deeply values nest, how many values it decodes, skips or fills in for a missing field or
 argument, how long the type table and the header are. The defaults reject the suite's attacks,
 such as fourteen bytes that claim a billion values.
+
+In a canister, lean-canister's [Interface.lean](../experiments/lean-canister/Interface.lean) and
+[Canister.lean](../experiments/lean-canister/Canister.lean) show the whole use: a table of the
+methods with the Lean types of their arguments and results, from which both the canister's
+handlers get their types and its `.did` file is generated, and a `serve` that decodes a
+message's argument and encodes its reply.
 
 ## The modules
 
@@ -185,16 +192,16 @@ A file that starts with `module` is a *module*, in which a definition is private
 needed: `import Candid` for the code that runs, `meta import Candid.Derive` for the code that
 runs while Lean compiles the file. A plain `import` is for what the module keeps private;
 `public import` also for what it makes public, and passes the imported module on to the files
-that import this one: a file that imports a module with `public import Candid` can call
-`Candid.decode`. A module can import only modules, while a plain file can import both. Lean's
-`Init` and this library are modules, so that a canister's files, which are modules for the
-reason below, can import them.
+that import this one: Canister.lean can call `Candid.decode` because Interface.lean, which it
+imports, has `public import Candid`. A module can import only modules, while a plain file can
+import both. Lean's `Init` and this library are modules, so that lean-canister's Interface.lean
+and Canister.lean, which are modules for the reason below, can import them.
 
 For a module `X`, `lean -c` writes initializers into the C. `runtime_initialize_X` does what the
 program needs when it runs, and calls the runtime initializers of `X`'s imports, except the
 `meta` ones. `initialize_X` also runs the meta phase, what Lean needs when it compiles a file
 that imports `X` (through `meta_initialize_X`, which initializes the `meta` imports), and calls
-the all-phase initializers of all the imports. A program's `main`, and a canister's
+the all-phase initializers of all the imports. A program's `main`, and lean-canister's
 `canister_init`, call the runtime one. As nothing calls the others, wasm-ld leaves them out, and
 with them every reference to `Candid.Derive` and Lean: only they refer to the handler, which is
 why the canister can derive. It also leaves out Init's meta phase, which is most of Init's code
@@ -202,6 +209,8 @@ why the canister can derive. It also leaves out Init's meta phase, which is most
 
 A definition's body is visible to other modules only if it is *exposed* (`@[expose]`), or an
 `abbrev`, which Lean also unfolds wherever it compares types, as when it looks for an instance.
+lean-canister's method table is made of `abbrev`s, so that in Canister.lean `greet.Args` is
+`String`, with `String`'s instances.
 
 The test programs are not modules, but plain files that import modules: `lean --run` of a plain
 file has the compiled code of all its imports, while that of a module could only run the code

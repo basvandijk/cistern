@@ -34,4 +34,4 @@ roots = ["Hello"]
 [[lean_lib]]
 name = "lean-canister"
 srcDir = "experiments/lean-canister"
-roots = ["Ic0", "Probes", "Canister", "RunProbe"]
+roots = ["Ic0", "Probes", "Interface", "Canister", "RunProbe", "GenDid"]

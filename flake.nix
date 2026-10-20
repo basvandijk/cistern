@@ -51,12 +51,14 @@
           inherit pocket-ic pocket-ic-py;
         };
 
-      # The Lean canister experiment, which builds on lean-wasm, see experiments/lean-canister.
+      # The Lean canister experiment, which builds on lean-wasm and uses the Candid library, see
+      # experiments/lean-canister.
       leanCanister =
         pkgs:
         import ./experiments/lean-canister {
           inherit pkgs;
           leanWasm = leanWasm pkgs;
+          candid = candid pkgs;
           pocket-ic = (pocketIc pkgs).pocket-ic or null;
           pocket-ic-py = (pocketIc pkgs).pocket-ic-py or null;
         };

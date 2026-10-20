@@ -3,8 +3,10 @@ The canister's entry points: the exported functions that the IC calls.
 
 canister_init and canister_post_upgrade initialize Lean: an upgrade starts with new memory. That
 also creates the notes, the state of Canister.lean. The query and update methods are the
-functions that Canister.lean exports, which reply or reject; they catch Lean's errors themselves.
-add_then_exit traps instead, as exit() calls wasi.c's proc_exit.
+functions that Canister.lean exports, which decode their Candid argument and reply or reject;
+they catch Lean's errors themselves. add_then_exit traps instead, as exit() calls wasi.c's
+proc_exit. The exports must be those of Interface.lean's methods, which the check
+lean-canister-interface (nix/did.nix) compares.
 
 Each entry point that returns ends by writing to the canister's log how many instructions its
 message has taken (ic0.performance_counter), and how many ic0.time calls clock_time_get has made
@@ -62,7 +64,10 @@ static void finish(char const * entry, unsigned long time_calls, char const * de
    meta_initialize_Canister what Lean needs when it compiles a file that imports the module (the
    `meta` code, such as syntax and elaborators that a module defines), and initialize_Canister
    calls both. Only the first is called, so wasm-ld leaves the others out, and with them the code
-   that only they reach. */
+   that only they reach. That includes the deriving handler of the Candid library, which
+   Interface.lean imports with `meta import`, and Lean's own modules, which the handler imports
+   and the link does not have: only meta_initialize_Interface refers to them, and
+   initialize_Interface, which calls it. */
 static void initialize(char const * entry) {
     unsigned long time_calls = wasi_ic0_time_calls;
     uint64_t start = ic0_performance_counter(0);
@@ -72,8 +77,8 @@ static void initialize(char const * entry) {
     // here, to measure it apart.
     lean_initialize_runtime_module();
     uint64_t runtime = ic0_performance_counter(0);
-    // The initializers of Canister.lean and its imports: Hello, Ic0, Probes and all of Init.
-    // Canister.lean's `initialize` creates the notes.
+    // The initializers of Canister.lean and its imports: Hello, Ic0, Probes, Interface, the
+    // Candid library and all of Init. Canister.lean's `initialize` creates the notes.
     lean_object * res = runtime_initialize_Canister(1 /* builtin */);
     if (lean_io_result_is_error(res)) {
         lean_io_result_show_error(res); // "uncaught exception: ..." to stderr
