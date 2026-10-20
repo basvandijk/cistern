@@ -4,9 +4,10 @@
 # lean-toolchain, finds the modules that a .lean file imports through the libraries below, and
 # builds them in .lake. VS Code does so when it opens the file because .vscode/settings.json
 # turns on lean4.automaticallyBuildDependencies. A module that a file imports must be one of a
-# library's `roots`. As in the Nix builds (`lean -R .`), a module is named after its file alone,
-# without the directory: experiments/lean-canister/Canister.lean is the module `Canister`, which
-# imports `Hello`, experiments/lean-wasm/Hello.lean.
+# library's `roots` or `globs`. As in the Nix builds (`lean -R .`), a module is named after its
+# path relative to the library's `srcDir`: experiments/lean-canister/Canister.lean is the module
+# `Canister`, which imports `Hello`, experiments/lean-wasm/Hello.lean, and candid/Candid/Ty.lean
+# is `Candid.Ty`.
 #
 # lean-toolchain names the version of the flake's Lean. elan, which runs Lean for the VS Code
 # extension, installs the official release of that version. That is a different build from the
@@ -16,7 +17,14 @@
 # if a .lean file has an error when opened. Lake writes lake-manifest.json, which lists no
 # dependencies.
 name = "cistern"
-defaultTargets = ["lean-wasm", "lean-canister"]
+defaultTargets = ["candid", "lean-wasm", "lean-canister"]
+
+[[lean_lib]]
+name = "candid"
+srcDir = "candid"
+roots = ["Candid"]
+# Candid and every Candid.X, the test programs included.
+globs = ["Candid.*"]
 
 [[lean_lib]]
 name = "lean-wasm"

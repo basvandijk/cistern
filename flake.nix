@@ -3,10 +3,18 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # The Candid specification's repository, for its conformance suite (candid/nix/conformance.nix)
+    # and the test files of its Rust parser (candid/nix/tests.nix). Not a flake: only its files
+    # are used. `nix flake update candid` moves it to the latest commit, and flake.lock records
+    # which one.
+    candid = {
+      url = "github:dfinity/candid";
+      flake = false;
+    };
   };
 
   outputs =
-    { self, nixpkgs }:
+    inputs@{ self, nixpkgs, ... }:
     let
       inherit (nixpkgs) lib;
 
@@ -20,6 +28,15 @@
 
       # The Lean → WebAssembly experiment, see experiments/lean-wasm.
       leanWasm = pkgs: import ./experiments/lean-wasm { inherit pkgs; };
+
+      # The Candid library, see candid. It is compiled for wasm32 with lean-wasm's runtime.
+      candid =
+        pkgs:
+        import ./candid {
+          inherit pkgs;
+          leanWasm = leanWasm pkgs;
+          candidSrc = inputs.candid;
+        };
 
       # PocketIC, a local IC replica, from ic-nix (see nix/pocket-ic.nix), and pocketic-py, its
       # Python library, in a Python environment (see nix/pocket-ic-py.nix). An attribute set,
@@ -46,12 +63,14 @@
     in
     {
       packages = forAllSystems (
-        pkgs: (leanWasm pkgs).packages // (leanCanister pkgs).packages // pocketIc pkgs
+        pkgs:
+        (leanWasm pkgs).packages // (candid pkgs).packages // (leanCanister pkgs).packages // pocketIc pkgs
       );
 
       checks = forAllSystems (
         pkgs:
         (leanWasm pkgs).checks
+        // (candid pkgs).checks
         // (leanCanister pkgs).checks
         // lib.optionalAttrs (pocketIc pkgs ? pocket-ic) {
           pocket-ic-runs = (pocketIc pkgs).pocket-ic.tests.runs;
