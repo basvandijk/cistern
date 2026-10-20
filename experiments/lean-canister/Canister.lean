@@ -1,3 +1,5 @@
+module
+
 import Hello
 import Ic0
 import Probes
@@ -81,10 +83,10 @@ def probe : BaseIO Unit := serve fun arg => do
 
 An `IO.Ref` is a mutable reference, here to an array. `initialize` declares a constant whose value
 an `IO` action computes when the module is initialized, here a reference to an empty array. The
-module's initializer, `initialize_Canister`, runs that action; c/canister.c calls it in
-`canister_init`, and again in `canister_post_upgrade`, as an upgrade starts with new memory. The
-reference and the notes are in the canister's memory, which the IC keeps from one update to the
-next. -/
+module's runtime initializer, `runtime_initialize_Canister`, runs that action; c/canister.c
+calls it in `canister_init`, and again in `canister_post_upgrade`, as an upgrade starts with new
+memory. The reference and the notes are in the canister's memory, which the IC keeps from one
+update to the next. -/
 initialize notesRef : IO.Ref (Array String) ← IO.mkRef #[]
 
 /-- Adds `note` to the notes, and returns how many there are. As it cannot fail, it is a `BaseIO`

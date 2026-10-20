@@ -72,8 +72,14 @@ Some Lean background:
   The generated C works for any target; it writes sizes as `sizeof(void*)` expressions, for
   example.
 - Each module has an initializer, `initialize_<Module>`, which computes the module's top-level
-  constants and calls the initializers of its imports. The `main` that Lean generates calls
-  `initialize_Hello`, which first calls `lean_initialize_runtime_module()`.
+  constants and calls the initializers of its imports. A module file, one that starts with
+  `module`, has a second one, `runtime_initialize_<Module>`, which does only what the program
+  needs when it runs. `initialize_<Module>` also runs the meta phase, `meta_initialize_<Module>`,
+  which does what only the compiler needs when it compiles a file that imports the module, such
+  as building the descriptors of the syntax that the module declares. All of Init's files are
+  module files, and so is Hello.lean, because lean-canister's Canister.lean, which is one,
+  imports it: a module file can import only module files. The `main` that Lean generates calls
+  `runtime_initialize_Hello`, which first calls `lean_initialize_runtime_module()`.
 - Lean evaluates closed terms such as `2 ^ 100` at compile time, so `Hello.c` would only contain
   the resulting string. That is why Hello.lean makes its numbers depend on the number of
   command-line arguments: this way the runtime computes them on WebAssembly.
@@ -90,8 +96,10 @@ $CC Hello.o libInit.a libleanrt.a -Wl,-z,stack-size=8388608 -Wl,--stack-first -l
 The link has to be complete: there is no `--allow-undefined`. wasm-ld drops unreferenced
 functions and data by default (`--gc-sections` is on unless `-r` is given, see
 [Driver.cpp](https://github.com/llvm/llvm-project/blob/main/lld/wasm/Driver.cpp)). Relinking the
-same inputs by hand (in `nix develop .#lean-wasm-hello`) with `-Wl,--gc-sections` gave a
-byte-identical module, and with `-Wl,--no-gc-sections` one of 8,617,485 bytes.
+same inputs by hand (in `nix develop .#lean-wasm-hello`, for example) with `-Wl,--gc-sections`
+gave a byte-identical module, and with `-Wl,--no-gc-sections` one of 8,618,536 bytes. The
+relinked module has to be named `hello.wasm` too, as wasm-ld writes the output's file name into
+the name section.
 
 ## Findings
 
@@ -178,14 +186,14 @@ The report checks the limits that the IC checks when a module is installed (in
 
 | hello.wasm                       | Value                                 | IC limit                                             |
 | -------------------------------- | ------------------------------------- | ---------------------------------------------------- |
-| module size                      | 1,999,514 bytes                       | 100 MiB [1]                                          |
-| gzipped (the IC accepts gzip)    | 263,036 bytes                         | 2 MiB per `install_code` message; larger modules are uploaded in chunks [1, 3] |
-| Code section                     | 1,519,291 bytes                       | 12 MiB [1, 4]                                        |
-| defined functions                | 5,834                                 | 50,000 [1]                                           |
+| module size                      | 935,707 bytes                         | 100 MiB [1]                                          |
+| gzipped (the IC accepts gzip)    | 147,863 bytes                         | 2 MiB per `install_code` message; larger modules are uploaded in chunks [1, 3] |
+| Code section                     | 765,985 bytes                         | 12 MiB [1, 4]                                        |
+| defined functions                | 2,286                                 | 50,000 [1]                                           |
 | most instructions in a function  | 5,399 (`lean_apply_1`)                | 1,000,000 [1, 4]                                     |
 | highest complexity of a function | 55,513 (`lean_apply_1`)               | 1,000,000, with validation.rs's weights [4]          |
 | most locals in a function        | 38                                    | 10,000 [4]                                           |
-| initial memory                   | 131 pages, 8,585,216 bytes            | 4 GiB of Wasm heap on wasm32 [1]                     |
+| initial memory                   | 129 pages, 8,454,144 bytes            | 4 GiB of Wasm heap on wasm32 [1]                     |
 | imports                          | 14, all from `wasi_snapshot_preview1` | only functions of `ic0` [2, 4]                       |
 | exports                          | `memory`, `_start`                    | the IC calls only `canister_*` entry points [2]      |
 
@@ -200,17 +208,28 @@ From the link map (`share/hello.map`), as summarised in the report:
 
 | Origin               | Code bytes | Functions | Object files |
 | -------------------- | ---------: | --------: | -----------: |
-| Lean's Init library  |  1,147,791 |     4,872 |          649 |
+| Lean's Init library  |    394,092 |     1,323 |          649 |
 | libc++ and libc++abi |    161,183 |       535 |           21 |
 | Lean runtime         |    146,418 |       250 |           16 |
 | wasi-libc            |     55,349 |       154 |          111 |
-| Hello.lean           |      8,421 |        21 |            1 |
+| Hello.lean           |      8,814 |        22 |            1 |
 
-Init accounts for 76% of the code. Code from every one of its 649 modules ends up in the
-module, because `initialize_Init` runs the initializer of each one. Most of the libc++ code is
-locale support (`locale.cpp`), which the runtime's use of iostreams pulls in. The name section
-takes another 360,518 bytes. `wasm-opt -O` makes the module 1,343,969 bytes (204,270 gzipped),
-partly by dropping that section. The optimized module has the same imports and exports.
+Init accounts for 51% of the code. Code from every one of its 649 modules ends up in the
+module, because `runtime_initialize_Init` runs the runtime initializer of each one. These 649
+functions take 324,324 bytes, 82% of Init's code. Most of the libc++ code is locale support
+(`locale.cpp`), which the runtime's use of iostreams pulls in. The name section takes another
+146,479 bytes. `wasm-opt -O` makes the module 631,163 bytes (110,059 gzipped), partly by
+dropping that section. The optimized module has the same imports and exports.
+
+Most of the code that `initialize_Init` brings in is only for the compiler. Before Hello.lean
+was a module file, `main` called `initialize_Hello`, and with it `initialize_Init`, which also
+runs the meta phase of each of Init's modules. hello.wasm then had 1,999,514 bytes, and Init
+1,147,791 bytes of code in 4,872 functions and 87,942 bytes of data. So 66% of that code
+(753,699 bytes in 3,549 functions) and 98% of that data (86,189 bytes) were there only for the
+meta phase. Nearly all of that is initialization code: the 649 `initialize_` functions, the meta
+initializers, and 2,499 functions that compute constants, 1,992 of them for the tactic scripts
+of auto-params (arguments that a tactic proves when the caller leaves them out) and 507 for the
+descriptors of Init's syntax, such as its tactics and notation.
 
 ### Wasm features
 
@@ -281,7 +300,7 @@ the rest of the runtime does not recompile Init. The configuration is minimal:
   at depth 5,000. The link uses 8 MiB, which is what Lean gives threads on 32-bit targets. With
   it, and also with 1 MiB, the engine's stack ran out first. `--stack-first` puts the stack at
   the bottom of memory, so that an overflow traps instead of overwriting data. The stack is 128
-  of the 131 initial pages.
+  of the 129 initial pages.
 
 ## Open questions and next steps
 
@@ -308,7 +327,7 @@ Wasm memory between messages and across an upgrade, but not stable memory or `op
    Linked with `-mexec-model=reactor` there is no `main`, and `_initialize` runs the
    constructors; [wasi2ic](https://github.com/wasm-forge/wasi2ic) makes that the Wasm start
    function. Lean's own initialization (`lean_initialize_runtime_module()`,
-   `initialize_<Module>(1)`, `lean_io_mark_end_initialization()`) then belongs in
+   `runtime_initialize_<Module>(1)`, `lean_io_mark_end_initialization()`) then belongs in
    `canister_init` and `canister_post_upgrade`, not in the start function, where most of the
    System API traps [2]. Init reads random bytes during initialization, so a polyfill's
    generator must be seeded before that. lean-canister links without crt1 (`-nostartfiles`)
@@ -324,12 +343,15 @@ Wasm memory between messages and across an upgrade, but not stable memory or `op
    [PocketIC](https://docs.internetcomputer.org/guides/testing/pocket-ic.md) runs an IC replica
    locally, which makes it the place to measure, and to confirm the recursion depths above,
    which come from wasmtime with the IC's stack size. In lean-canister, `canister_init` takes
-   7.5 million instructions and the install 6.3 billion, and PocketIC allows more depth than
+   2.2 million instructions and the install 3.5 billion, and PocketIC allows more depth than
    the table above (see [Recursion depth](#recursion-depth)).
-6. **Size.** Size is not a blocker, but Init's initializers keep 1.1 MB of Init in even a hello
-   world. A file that starts with `prelude` does not import Init implicitly, and can import just
-   the Init modules it needs; whether that helps is untested. Std and Lean code that needs libuv
-   (timers, sockets), OpenSSL or compacted regions does not link yet.
+6. **Size.** Size is not a blocker, but Init's runtime initializers keep 0.39 MB of Init in even
+   a hello world, 0.32 MB of it the initializers themselves. Init's meta phase, which only the
+   compiler needs, is left out, as Hello.lean is a module file: 0.75 MB of code, 66% of the
+   1.15 MB that Init had before (see [Where the size comes from](#where-the-size-comes-from)). A
+   file that starts with `prelude` does not import Init implicitly, and can import just the Init
+   modules it needs; whether that helps is untested. Std and Lean code that needs libuv (timers,
+   sockets), OpenSSL or compacted regions does not link yet.
 7. **Traps.** Any C++ `throw` traps, including ones that native Lean reports gracefully. So does
    running out of stack, at depths that native Lean handles easily (see [Recursion
    depth](#recursion-depth)). On a trap, output still buffered in stdout is lost.

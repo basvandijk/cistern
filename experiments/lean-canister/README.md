@@ -13,28 +13,29 @@ and updates. Its `hello` query replies exactly what `lean --run Hello.lean` prin
 updates store in an `IO.Ref` stays from one message to the next, unless the update traps; a
 query's changes are discarded, and an upgrade starts afresh. With the IC's production limits:
 
-- Installing takes 6.3 billion instructions of the 300 billion that an install may use, nearly
-  all of them for compiling the module. Lean's initialization in `canister_init` takes 7.5 million.
-- A query takes at least 0.4 million instructions of the 5 billion that it may use. Memory counts
+- Installing takes 3.5 billion instructions of the 300 billion that an install may use, nearly
+  all of them for compiling the module. Lean's initialization in `canister_init` takes 2.2 million.
+- A query takes at least 0.16 million instructions of the 5 billion that it may use. Memory counts
   too: the IC charges 80,000 instructions for each 64 KiB page of memory that a message touches.
-- An update that adds a note to the `IO.Ref` takes 0.72 million instructions of the 40 billion
-  that it may use, 0.32 million more than the same code as a query. That is the charge for the
-  4 pages that it writes: an update pays as much again for the first write to a page.
+- An update that adds a note to the `IO.Ref` takes 0.32 million instructions of the 40 billion
+  that it may use, 0.16 million more than the same code as a query. That is the charge for the
+  2 pages that it writes: an update pays as much again for the first write to a page.
 - The 5 MiB Wasm stack allows 16,378 to 109,198 levels of recursion for lean-wasm's probes. That is
   as much as wasmtime allows with the same stack and Cranelift's optimizations off, and up to 29%
   more than with its default optimizations, which lean-wasm's estimates used.
 - On non-ASCII text, `String.toUpper` takes about 4n² instructions for n characters, as Lean's
-  `String.map` is quadratic on such text. A query that builds a string of 34,965 such characters
+  `String.map` is quadratic on such text. A query that builds a string of 34,966 such characters
   and upper-cases it exceeds the limit of a query. On ASCII text `toUpper` takes 177 instructions
   per character.
 
 The measurements come from the report of `lean-canister-report`, built on x86_64-linux, the
 depths in wasmtime included. The exceptions are the modules' imports and exports, which
-wasm-objdump lists, the 12 WASI functions that the link keeps, which its map lists
-(`share/canister.map`), and what is quoted from lean-wasm. The IC's costs and limits come from
-its source (see [Sources](#sources)). Every step is a Nix derivation that builds in the sandbox.
-PocketIC and wasmtime are deterministic, so `nix build --rebuild` reproduces the report bit for
-bit, as it does the modules.
+wasm-objdump lists, the 12 WASI functions that the link keeps and where it places the data,
+which its map lists (`share/canister.map`), what is quoted from lean-wasm, and the figures from
+before Canister.lean and its imports were module files, from that version's report and map. The
+IC's costs and limits come from its source (see [Sources](#sources)). Every step is a Nix
+derivation that builds in the sandbox. PocketIC and wasmtime are deterministic, so
+`nix build --rebuild` reproduces the report bit for bit, as it does the modules.
 
 ## Running it
 
@@ -114,9 +115,15 @@ RunProbe.lean natively (lean --run) ┘
 - [c/canister.c](c/canister.c) has the entry points that the module exports. `canister_init`, and
   `canister_post_upgrade`, as an upgrade starts with new memory, do what a Lean program does
   before its `main`. They run the C++ constructors (`__wasm_call_ctors`), as crt1's `_start`
-  would, and then, as Lean's generated `main` does, `initialize_Canister(1)`, which calls
-  `lean_initialize_runtime_module()`, the initializers of the imported modules and Canister.lean's
-  own, which creates the notes. Then they call `lean_io_mark_end_initialization()`. Each
+  would, and then, as Lean's generated `main` does, `runtime_initialize_Canister(1)`, which calls
+  `lean_initialize_runtime_module()`, the runtime initializers of the imported modules and
+  Canister.lean's own, which creates the notes. Then they call
+  `lean_io_mark_end_initialization()`. Canister.lean and its imports are module files (`module`),
+  as Init's are, and for a module Lean generates `runtime_initialize_<Module>`, which initializes
+  what the program needs when it runs, besides `initialize_<Module>`, which also initializes what
+  Lean needs when it compiles a file that imports the module, the meta phase, such as the syntax
+  and elaborators that the module defines. Only the first is called, so wasm-ld leaves out the
+  second, and with it the code that only it reaches (see [Installation](#installation)). Each
   `canister_query <name>` and `canister_update <name>` calls a function that Canister.lean exports
   with `@[export]`; `canister_query add_query` calls the same one as `canister_update add`, under a
   name of its own, as the IC refuses a module that exports a name as a query and as an update
@@ -195,9 +202,9 @@ management canister's `raw_rand`, which takes a call to another canister.
   `fun n => let xs := List.range n; fun _ => ...` into one function of two arguments, which built
   the input in the measured part.
 - Each entry point that returns ends by logging its instructions, as in `canister_query greet:
-  409614 instructions, 0 ic0.time calls`; one that traps logs none. PocketIC prints the
+  169607 instructions, 0 ic0.time calls`; one that traps logs none. PocketIC prints the
   canister's log on its standard error, where measure.py reads it. The count cannot include the
-  logging itself: for `canister_init`, the replica counts 12,751 instructions more. The replica
+  logging itself: for `canister_init`, the replica counts 12,663 instructions more. The replica
   logs what each `install_code` took, but not what an update took.
 - The replica answers a query that it has answered before from a cache, without running it,
   unless the entry has expired, the canister's version has changed, or the query read the time or
@@ -219,17 +226,17 @@ management canister's `raw_rand`, which takes a call to another canister.
 
 | Module              |     Bytes | Gzipped |
 | ------------------- | --------: | ------: |
-| `canister.wasm`     | 2,080,316 | 282,603 |
-| `canister-opt.wasm` | 1,407,933 | 221,509 |
+| `canister.wasm`     | 1,017,382 | 166,549 |
+| `canister-opt.wasm` |   695,676 | 126,399 |
 
 The modules import 9 functions, all from `ic0`. They export `canister_init`,
 `canister_post_upgrade`, `canister_query greet`, `canister_query hello`, `canister_query probe`,
 `canister_update add`, `canister_query add_query`, `canister_update add_then_exit`,
 `canister_update add_then_throw`, `canister_query notes` and their memory. An ingress message
 may have at most 2 MiB ([resource limits][limits]). The
-`install_code` message with canister.wasm would just fit; gzipped, which the IC accepts
-([interface specification][spec]), the module fits with room to spare, and so measure.py installs
-both. In PocketIC:
+`install_code` message with canister.wasm would fit, as the module is less than half that size;
+gzipped, which the IC accepts ([interface specification][spec]), it is less than a tenth, and
+measure.py installs both so. In PocketIC:
 
 - `greet "world"` replies `Hello, world!`, and its `IO.println` reaches the canister's log.
 - `hello` and `hello "a b"` reply the six lines that `lean --run Hello.lean` prints, with
@@ -244,30 +251,37 @@ both. In PocketIC:
 
 | Instructions                        | canister.wasm | canister-opt.wasm |
 | ----------------------------------- | ------------: | ----------------: |
-| `install_code`                      | 6,338,385,483 |     5,818,694,077 |
-| `canister_init`                     |     7,530,732 |         7,127,455 |
-| of which C++ constructors           |       413,842 |           412,854 |
+| `install_code`                      | 3,496,678,603 |     3,108,877,586 |
+| `canister_init`                     |     2,239,940 |         2,117,050 |
+| of which C++ constructors           |       253,842 |           252,854 |
 | of which the Lean runtime           |        11,854 |            11,280 |
-| of which the modules' initializers  |     7,018,419 |         6,616,917 |
-| `install_code` of an upgrade        |    90,652,446 |        85,056,159 |
+| of which the modules' initializers  |     1,887,627 |         1,766,512 |
+| `install_code` of an upgrade        |    56,997,406 |        52,997,608 |
 
 `install_code` is the replica's count for the whole message. `canister_init` is the counter at
 the end of `canister_init`, and `canister_post_upgrade` takes as many instructions, which
 measure.py checks. There are two upgrades, one before and one after the updates of
 [State across updates](#state-across-updates), and they took the same.
 
+- `canister_init` runs only the runtime phase of the initializers, as c/canister.c calls
+  `runtime_initialize_Canister` (see [How it works](#how-it-works)). The meta phase, which
+  computes what only the compiler uses, such as the syntax that Init defines, does not run, and
+  wasm-ld leaves out its code and data. Before Canister.lean and its imports were module files,
+  c/canister.c called `initialize_Canister`, which runs both phases: then `canister_init` took
+  7,530,732 instructions, 7,018,419 of them in the modules' initializers, with 2,691 `ic0.time`
+  calls, and canister.wasm had 2,080,316 bytes, whose install took 6,338,385,483 instructions.
 - Compiling takes most of the install. The IC charges 20 million instructions for it, plus 6,000
   for each instruction of the module after it has instrumented the module for counting
   ([embedders.rs][embedders], [instrumentation.rs][instrumentation]). For canister.wasm that is
-  (6,338,385,483 - 7,543,483 - 20,000,000) / 6,000 = 1,051,807 instructions, where 7,543,483 is
+  (3,496,678,603 - 2,252,603 - 20,000,000) / 6,000 = 579,071 instructions, where 2,252,603 is
   the replica's count of `canister_init`. For a module that the subnet has installed since its
   last checkpoint, the 6,000 drop to 60 ([execution_environment.rs][compiled]), but the 20
   million remain ([hypervisor.rs][hypervisor]). A successful `install_code` records its module
   ([execution_environment.rs][compiled-wasms-insert]), which the next one looks up
   ([execution_environment.rs][compiled-wasms]), and a checkpoint forgets them
-  ([scheduler.rs][checkpoint]). So each upgrade took 7,544,026 for `canister_post_upgrade` +
-  20,000,000 + 60 × 1,051,807 = 90,652,446. An install may use 300
-  billion instructions ([subnet_config.rs][subnet-config]), so this one uses 2%.
+  ([scheduler.rs][checkpoint]). So each upgrade took 2,253,146 for `canister_post_upgrade` +
+  20,000,000 + 60 × 579,071 = 56,997,406. An install may use 300
+  billion instructions ([subnet_config.rs][subnet-config]), so this one uses 1%.
 - The IC charges the instructions of an `install_code` to the canister, and refuses the next one
   (`CanisterInstallCodeRateLimited`) until the rounds have paid them off, at 2 billion at the
   end of every round, the install's own round included ([install_code.rs][install-code],
@@ -276,13 +290,12 @@ measure.py checks. There are two upgrades, one before and one after the updates 
   subnet's schedule. `install_code` puts the canister there when it puts it back with its debit
   ([replicated_state.rs][subnet-schedule]), and it stays there as long as it has a debit, also in
   a round in which it has nothing to execute ([canister_state.rs][must-be-in-schedule],
-  [round_schedule.rs][schedule-retain]). So the IC refused the first upgrade in the 3 rounds
-  after the install, and accepted it in the 4th (canister-opt.wasm: in 2 rounds, and in the 3rd).
-  In PocketIC, each try took a round, and so did the upgrade. It accepted the second upgrade at
-  once: the first's 91 million instructions (canister-opt.wasm: 85 million) were paid off at the
-  end of its own round.
-- `canister_init` made 2,691 `ic0.time` calls, which cost at least 2,691 × 500 = 1,345,500
-  instructions, 18% of it. They come from Lean's lazily initialized constants (closed terms). The
+  [round_schedule.rs][schedule-retain]). So the IC refused the first upgrade in the round after
+  the install, and accepted it in the 2nd, on both modules. In PocketIC, each try took a round,
+  and so did the upgrade. It accepted the second upgrade at once: the first's 57 million
+  instructions (canister-opt.wasm: 53 million) were paid off at the end of its own round.
+- `canister_init` made 192 `ic0.time` calls, which cost at least 192 × 500 = 96,000
+  instructions, 4% of it. They come from Lean's lazily initialized constants (closed terms). The
   first use of one takes a lock with `std::atomic<int>::wait` ([object.cpp][lean-once]), and
   libc++'s wait reads the clock before it first looks at the lock ([poll_with_backoff.h][libcxx]).
   That is `clock_time_get`, which c/wasi.c answers with `ic0.time`. A runtime without threads
@@ -292,18 +305,23 @@ measure.py checks. There are two upgrades, one before and one after the updates 
 
 | Instructions of the query                 | canister.wasm | canister-opt.wasm |
 | ----------------------------------------- | ------------: | ----------------: |
-| `greet "world"`                           |       409,614 |           409,254 |
-| `hello ""`                                |       915,871 |           889,249 |
-| `hello "a b"`                             |       967,287 |           937,768 |
-| `probe "noop 0"`: no work, 286 measured   |       428,012 |           426,623 |
+| `greet "world"`                           |       169,607 |           169,247 |
+| `hello ""`                                |       756,391 |           729,765 |
+| `hello "a b"`                             |       807,807 |           778,284 |
+| `probe "noop 0"`: no work, 286 measured   |       188,012 |           186,623 |
 
 These are the counts that the entry point logs, so they leave out the logging (see
 [Measuring](#measuring)). The measured work of the `noop` probe takes 286 instructions. The rest
 of its query goes to the entry point, to reading and parsing the argument, to the reply, and to
 the charges for the memory that these touch. How it divides was not measured;
-[Memory pages](#memory-pages) shows the charges in the probes. Each `hello` query also makes 12
-`ic0.time` calls: it initializes 12 closed terms, which the next query initializes again, as the
-IC discards the changes that a query makes to memory ([abstract behavior][abstract]).
+[Memory pages](#memory-pages) shows the charges in the probes. Before Canister.lean and its
+imports were module files (see [Installation](#installation)), this query took 428,012
+instructions, exactly 240,000 more, the charge for 3 more pages that it touched. Without the meta
+phase, the initializers create fewer objects, and the module's data (`.rodata`, `.data` and
+`.bss`), which the link places at 8 MiB, after the C stack, lies on 1 page instead of 3
+(`share/canister.map`). Each `hello` query also makes 12 `ic0.time` calls: it initializes 12
+closed terms, which the next query initializes again, as the IC discards the changes that a
+query makes to memory ([abstract behavior][abstract]).
 
 ### State across updates
 
@@ -315,17 +333,17 @@ argument of its own, `1` to `5`, which it ignores (see [Measuring](#measuring)).
 
 | Call, in this order                         | Reply or outcome                | canister.wasm | canister-opt.wasm |
 | ------------------------------------------- | ------------------------------- | ------------: | ----------------: |
-| `add "a"` (update)                          | `1`                             |       724,871 |           724,681 |
-| `add_query "b"` (query)                     | `2`                             |       404,714 |           404,542 |
-| `notes` (query)                             | `#[a]`                          |       407,008 |           406,723 |
-| `add "b"` (update)                          | `2`                             |       724,714 |           724,542 |
-| `notes` (query)                             | `#[a, b]`                       |       408,268 |           407,922 |
+| `add "a"` (update)                          | `1`                             |       324,871 |           324,681 |
+| `add_query "b"` (query)                     | `2`                             |       164,714 |           164,542 |
+| `notes` (query)                             | `#[a]`                          |       167,008 |           166,723 |
+| `add "b"` (update)                          | `2`                             |       324,714 |           324,542 |
+| `notes` (query)                             | `#[a, b]`                       |       168,268 |           167,922 |
 | `add_then_exit "c"` (update)                | trap: `exit(3)`                 |               |                   |
-| `notes` (query)                             | `#[a, b]`                       |       408,268 |           407,922 |
-| `add_then_throw "d"` (update)               | reject: `added d, then threw`   |       726,619 |           726,375 |
-| `notes` (query)                             | `#[a, b, d]`                    |       409,225 |           408,851 |
-| second upgrade: `canister_post_upgrade`     | accepted at once                |     7,530,732 |         7,127,455 |
-| `notes` (query)                             | `#[]`                           |       405,635 |           405,402 |
+| `notes` (query)                             | `#[a, b]`                       |       168,268 |           167,922 |
+| `add_then_throw "d"` (update)               | reject: `added d, then threw`   |       326,623 |           326,380 |
+| `notes` (query)                             | `#[a, b, d]`                    |       169,225 |           168,851 |
+| second upgrade: `canister_post_upgrade`     | accepted at once                |     2,239,940 |         2,117,050 |
+| `notes` (query)                             | `#[]`                           |       165,635 |           165,402 |
 
 - The notes stay from one update to the next, and the queries in between see them: the IC keeps
   what an update that does not trap changed in memory.
@@ -346,17 +364,18 @@ argument of its own, `1` to `5`, which it ignores (see [Measuring](#measuring)).
   instructions as `canister_init`, part by part, as both run the same initializers in new
   memory.
 
-An update costs more than a query. `add "b"` took 320,000 instructions more than
+An update costs more than a query. `add "b"` took 160,000 instructions more than
 `add_query "b"`, on both modules, which runs the same code with the same argument from the same
-memory, as the IC discards what the queries between them changed. That is 4 pages at 80,000,
+memory, as the IC discards what the queries between them changed. That is 2 pages at 80,000,
 and measure.py checks that the difference is a multiple of 80,000: an update pays as much again
 for its first write to a 64 KiB page as for its first access, which a query pays as well
-([deterministic.rs][tracker], [system_api.rs][modification-tracking]). The 4 pages are all that
+([deterministic.rs][tracker], [system_api.rs][modification-tracking]). The 2 pages are all that
 `add` wrote before c/canister.c read the counter. Which they are was not measured; from the
 code, the notes, and also the C stack, which lies in memory, unlike the Wasm stack, the
-allocator's state and buffers. The first `add`, which copies the empty array, took 157
-instructions more than the second (canister-opt.wasm: 139). None of the updates made an
-`ic0.time` call, so they initialized no closed terms.
+allocator's state and buffers, which lie in the module's data (see [Queries](#queries)). The
+first `add`, which copies the empty array, took 157 instructions more than the second
+(canister-opt.wasm: 139). None of the updates made an `ic0.time` call, so they initialized no
+closed terms.
 
 ### Recursion depth
 
@@ -368,7 +387,7 @@ The largest depth that worked, for the probes of lean-wasm (see
 | `deep n`                                | 100,000 | 109,203 | 109,205 | 109,198 | 109,203 |
 | `(countM n).run 0`                      |  50,000 |  65,519 |  81,902 |  81,896 |  81,899 |
 | `toString (repr (List.range n))`        |  10,000 |  18,196 |  23,396 |  23,394 |  23,396 |
-| `xs.zip xs`, where `xs := List.range n` |  20,000 |  46,800 |  54,602 |  54,598 |  46,800 |
+| `xs.zip xs`, where `xs := List.range n` |  20,000 |  46,800 |  54,602 |  54,597 |  46,800 |
 | `deepK n id`                            |  10,000 |  15,599 |  16,379 |  16,378 |  16,379 |
 | `deepKB n id`                           |  10,000 |  15,599 |  16,379 |  16,378 |  16,379 |
 
@@ -393,16 +412,16 @@ measure.py tries: the 1-2-5 series, and for `toUpper` 10,000, 20,000, 40,000 and
 | ------------------------------- | ------------- | --------------: | -------------------: |
 | `deep n`                        | 100,000       |       5,800,307 |                   58 |
 | `(countM n).run 0`              | 50,000        |       4,450,650 |                   89 |
-| `deepK n id`                    | 10,000        |       5,991,717 |                  599 |
-| `xs.zip xs`                     | 50,000        |      48,345,824 |                  967 |
-| `deepKB n id`                   | 10,000        |      33,836,033 |                3,384 |
-| `toString (repr xs)`            | 20,000        |     391,666,350 |               19,583 |
+| `deepK n id`                    | 10,000        |       6,072,237 |                  607 |
+| `xs.zip xs`                     | 50,000        |      48,345,834 |                  967 |
+| `deepKB n id`                   | 10,000        |      33,916,553 |                3,392 |
+| `toString (repr xs)`            | 20,000        |     391,666,351 |               19,583 |
 | `s.toUpper`, ASCII              | 1,280,000     |     226,561,682 |                  177 |
 | `s.toUpper`, U+0100–U+01FF      | 20,000        |   1,634,480,250 |               81,724 |
 
 Preparing the input is not counted: `List.range n` for `repr` and `zip`, and the string for
 `toUpper`. Building the string costs more than upper-casing it in ASCII: its query takes
-1,942,442,305 instructions in all.
+1,942,282,825 instructions in all.
 
 ### `String.map` exceeds the limit of a query
 
@@ -412,7 +431,7 @@ twice ([object.cpp][lean-utf8-set]). With 2 bytes per character in UTF-8 and an 
 byte that `memory.copy` copies ([instrumentation.rs][instrumentation]), that is about 4n²
 instructions for n characters: 1.6 billion for 20,000, as measured (1,634,480,250). By 4n², the
 limit of 5 billion instructions for a query would allow about 35,000 characters (35,355).
-Bisection found that `toUpper` worked at 34,964 and failed at 34,965: the query does more that
+Bisection found that `toUpper` worked at 34,965 and failed at 34,966: the query does more that
 grows with the string, such as building it. lean-wasm timed 40,000 characters at 100 ms under
 wasmtime. An update may use 40 billion instructions ([subnet_config.rs][subnet-config]),
 which by 4n² would allow about 100,000 characters (not measured).
@@ -425,21 +444,21 @@ memory pages or initialized closed terms, which the second finds ready (canister
 | Probe                   |  First run | Second run | Difference |
 | ----------------------- | ---------: | ---------: | ---------: |
 | `deep 1,000`            |     58,307 |     58,307 |          0 |
-| `zip 1,000`             |    968,864 |    888,344 |     80,520 |
-| `repr 1,000`            | 18,896,168 | 18,645,244 |    250,924 |
-| `deepKB 1,000`          |  3,271,357 |  3,164,851 |    106,506 |
+| `zip 1,000`             |    968,874 |    888,354 |     80,520 |
+| `repr 1,000`            | 18,896,169 | 18,645,245 |    250,924 |
+| `deepKB 1,000`          |  3,351,877 |  3,164,851 |    187,026 |
 | `toUpper 10,000`        |  1,771,682 |  1,771,682 |          0 |
 
 `deep` uses only the Wasm stack, which is not memory that the IC charges for. For `zip`, the
 difference is about the charge for one page. The counts of a first run therefore depend on where
-in memory the allocator places objects: `deepKB 1,000` took 3,369,313 instructions in a query of
-its own, and 3,271,357 here.
+in memory the allocator places objects: `deepKB 1,000` took 3,449,833 instructions in a query of
+its own, and 3,351,877 here.
 
 ### wasm-opt
 
-`wasm-opt -O` makes the module 32% smaller, and 22% gzipped. The install takes 8% fewer
+`wasm-opt -O` makes the module 32% smaller, and 24% gzipped. The install takes 11% fewer
 instructions, as there are fewer to compile; `canister_init` 5% fewer, the queries and updates
-up to 3% and the probes up to 6% fewer. The depth of `zip` drops by 14%.
+up to 4% and the probes up to 6% fewer. The depth of `zip` drops by 14%.
 
 ## Open questions and next steps
 
@@ -471,23 +490,24 @@ up to 3% and the probes up to 6% fewer. The depth of `zip` drops by 14%.
    stay; the updates of [State across updates](#state-across-updates) initialize none. So it
    could pay to initialize them early, for example by running the code of each query once in
    `canister_init`, without replying.
-5. **The clock reads.** 18% of `canister_init` goes to reading the clock for locks that a runtime
+5. **The clock reads.** 4% of `canister_init` goes to reading the clock for locks that a runtime
    without threads does not need (see [Installation](#installation)). Patching the runtime's
    `lock_simple_atomic`, or caching `ic0.time` per message in c/wasi.c, would save that.
 6. **Randomness and asynchronous calls.** `random_get` gives the same bytes in every canister. Real
    randomness comes from `raw_rand`, which, like any call to another canister, replies in a
    later message. As lean-wasm found, `IO.Promise` does not work without a task manager.
-7. **Memory charges.** A query that does nothing takes 0.4 million instructions. How much of
-   that is the charge for memory pages was not measured; reading `ic0.performance_counter` at
-   points within a query would show it. An update pays for the pages that it writes as well:
-   `add` 320,000 instructions for 4 pages (see [State across updates](#state-across-updates)).
+7. **Memory charges.** A query that does nothing, `probe "noop 0"`, takes 0.19 million
+   instructions. How much of that is the charge for memory pages was not measured; reading
+   `ic0.performance_counter` at points within a query would show it. An update pays for the
+   pages that it writes as well: `add` 160,000 instructions for 2 pages (see
+   [State across updates](#state-across-updates)).
    The counts of Lean code depend on where objects lie. The
    runtime allocates every object with wasi-libc's `malloc`; an allocator that keeps a message's
    objects on fewer pages could take fewer instructions.
-8. **Compilation.** Compiling takes 6,000 instructions per instruction of the module, 6.3 billion
-   for this one. Init accounts for most of the code (see lean-wasm), and a module that imports
+8. **Compilation.** Compiling takes 6,000 instructions per instruction of the module, 3.5 billion
+   for this one. Init accounts for half of the code (see lean-wasm), and a module that imports
    less of it would install for less. Installing the module again, in an upgrade, a reinstall or
-   another canister, costs 20 million plus a hundredth of the rest, 83 million, but only until
+   another canister, costs 20 million plus a hundredth of the rest, 55 million, but only until
    the subnet's next checkpoint.
 9. **Mainnet.** On the IC, `ic0.debug_print` adds to the canister's log, which keeps 4 KiB by
    default, and the replica prints nothing. A non-replicated query's log is discarded. An

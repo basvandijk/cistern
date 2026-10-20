@@ -1,8 +1,12 @@
+module
+
 /-!
 The probes, from the measurements of recursion depth and of `String.map` in
 ../lean-wasm/README.md. The canister's `probe` query (Canister.lean) runs them in PocketIC, and
 RunProbe.lean under wasmtime and natively.
 -/
+
+public section
 
 /-- Non-tail recursion. -/
 def deep : Nat → Nat

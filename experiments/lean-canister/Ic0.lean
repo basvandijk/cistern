@@ -1,3 +1,5 @@
+module
+
 /-!
 Lean bindings of the Internet Computer's System API: the Wasm module `ic0`, whose functions a
 canister imports
@@ -11,7 +13,12 @@ are here, and `countInstructions`, which measures with `ic0.performance_counter`
 None of them returns an error, so they are `BaseIO` actions. The System API traps instead, which
 rolls back the message, for example when a function is called where it is not allowed, such as
 `msgReply` in `canister_init`.
+
+`public section`: the bindings are public, as Canister.lean calls them; in a module file,
+definitions are private by default.
 -/
+
+public section
 
 namespace Ic0
 

@@ -27,7 +27,7 @@ void __wasm_call_ctors(void);
 void lean_initialize_runtime_module(void);
 
 /* Canister.lean */
-lean_object * initialize_Canister(uint8_t builtin);
+lean_object * runtime_initialize_Canister(uint8_t builtin);
 lean_object * cistern_greet(void);
 lean_object * cistern_hello(void);
 lean_object * cistern_probe(void);
@@ -51,26 +51,33 @@ static void finish(char const * entry, unsigned long time_calls, char const * de
 }
 
 /* What a Lean program does before its `main`: crt1's _start runs the C++ constructors, and
-   Lean's generated `main` runs initialize_Canister, which calls lean_initialize_runtime_module
-   and the initializers of the imported modules, and lean_io_mark_end_initialization. That
-   `main` also calls lean_setup_args, which does nothing here (../../lean-wasm/runtime/
-   wasi-stubs.cpp), and lean_init_task_manager, which does nothing in a runtime without
-   threads. */
+   Lean's generated `main` runs runtime_initialize_Canister, which calls
+   lean_initialize_runtime_module and the runtime initializers of the imported modules, and
+   lean_io_mark_end_initialization. That `main` also calls lean_setup_args, which does nothing
+   here (../../lean-wasm/runtime/wasi-stubs.cpp), and lean_init_task_manager, which does nothing
+   in a runtime without threads.
+
+   Canister.lean is a module file, and Lean generates three initializers for a module:
+   runtime_initialize_Canister initializes what the program needs when it runs,
+   meta_initialize_Canister what Lean needs when it compiles a file that imports the module (the
+   `meta` code, such as syntax and elaborators that a module defines), and initialize_Canister
+   calls both. Only the first is called, so wasm-ld leaves the others out, and with them the code
+   that only they reach. */
 static void initialize(char const * entry) {
     unsigned long time_calls = wasi_ic0_time_calls;
     uint64_t start = ic0_performance_counter(0);
     __wasm_call_ctors();
     uint64_t constructed = ic0_performance_counter(0);
-    // initialize_Canister calls this too, and then it returns at once. Called first here, to
-    // measure it apart.
+    // runtime_initialize_Canister calls this too, and then it returns at once. Called first
+    // here, to measure it apart.
     lean_initialize_runtime_module();
     uint64_t runtime = ic0_performance_counter(0);
     // The initializers of Canister.lean and its imports: Hello, Ic0, Probes and all of Init.
     // Canister.lean's `initialize` creates the notes.
-    lean_object * res = initialize_Canister(1 /* builtin */);
+    lean_object * res = runtime_initialize_Canister(1 /* builtin */);
     if (lean_io_result_is_error(res)) {
         lean_io_result_show_error(res); // "uncaught exception: ..." to stderr
-        wasi_ic0_trap("initialize_Canister failed");
+        wasi_ic0_trap("runtime_initialize_Canister failed");
     }
     lean_dec_ref(res);
     lean_io_mark_end_initialization();
