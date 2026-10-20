@@ -25,20 +25,27 @@ only if it is called as one.
 Then upgrades each canister to the same module, and tries its state, the notes, with the updates
 add, add_then_exit and add_then_throw and the queries add_query and notes: what an update or a
 reject adds to the notes must stay, and what a query or a trap adds must not. Then upgrades the
-canister again, after which there must be no notes. With --run-probe, also runs the recursion probes
-under wasmtime (default: wasmtime) in that program, RunProbe.lean, for their depths there. With
---native, which is a command that runs RunProbe.lean natively, such as `lean --run RunProbe.lean`
-with LEAN_PATH set, checks the probe results that have no formula, those of repr, against it.
+canister again, after which there must be no notes. Then, with both canisters installed, tries
+the methods that call other canisters (see Canister.lean and Ic.lean): random, which calls the
+management canister's raw_rand, greet_via, which calls greet of the canister itself and of the
+other one, add_twice and add_both, which call add of the canister itself, call_raw with a
+method that rejects, with one that does not exist and with a canister that does not exist,
+call_then_exit, whose callback traps, call_then_throw, whose callback throws, oneway_add, and
+call_in_query, a query that calls, which traps; and upgrades a third time, which runs
+canister_pre_upgrade. With --run-probe, also runs the recursion probes under wasmtime (default:
+wasmtime) in that program, RunProbe.lean, for their depths there. With --native, which is a
+command that runs RunProbe.lean natively, such as `lean --run RunProbe.lean` with LEAN_PATH set,
+checks the probe results that have no formula, those of repr, against it.
 
 Prints the report on standard output, and writes the measurements to the --json file. Fails if a
 module does not install or upgrade, or a reply, a probe's result, the notes or the charge for the
 pages that an update writes are wrong.
 
-The canister logs how many instructions each message takes, unless it traps (c/canister.c), and
-PocketIC prints the canister's log on its standard error. Queries and updates are counted with
-ic0.performance_counter, which includes the System API's charges, such as the one for each
-64 KiB page of memory that a message touches, and in an update for each page that it writes.
-Needs pocketic-py 3, which ../../nix/pocket-ic-py.nix provides.
+The canister logs how many instructions each message takes, unless it traps (c/canister.c), the
+callbacks of its calls too (c/ic0.c), and PocketIC prints the canister's log on its standard error.
+Queries and updates are counted with ic0.performance_counter, which includes the System API's
+charges, such as the one for each 64 KiB page of memory that a message touches, and in an update
+for each page that it writes. Needs pocketic-py 3, which ../../nix/pocket-ic-py.nix provides.
 """
 
 import argparse
@@ -268,11 +275,14 @@ REJECTS = {
                    " or reserved at byte 6",
 }
 
-# What c/canister.c logs at the end of each entry point.
+# What c/canister.c logs at the end of each entry point, and c/ic0.c at the end of each callback.
 ENTRY_LINE = re.compile(
-    r"(canister_init|canister_post_upgrade|canister_(?:query|update) \w+): (\d+) instructions,"
-    r" (\d+) ic0\.time calls(?: \((.*)\))?"
+    r"(canister_init|canister_pre_upgrade|canister_post_upgrade|canister_(?:query|update) \w+"
+    r"|(?:reply|reject|cleanup) callback): (\d+) instructions, (\d+) ic0\.time calls(?: \((.*)\))?"
 )
+
+# The anonymous principal, 2vxsx-fae, which is not a canister.
+NOT_A_CANISTER = "2vxsx-fae"
 
 
 class Canister:
@@ -292,28 +302,40 @@ class Canister:
         """The instance's time, in nanoseconds. As nothing sets it, each round advances it by 1."""
         return self.pic.get_time()["nanos_since_epoch"]
 
-    def _entry(self, make_call, entry):
-        """Makes the call, and returns its result with what the canister logged. The log ends
-        with c/canister.c's line for the entry point, unless the message trapped."""
+    def _entry(self, make_call, entry, last=None):
+        """Makes the call, and returns its result with what the canister logged: the lines that
+        are not entry lines, the measurements of the entry line of `entry`, and those of every
+        entry line, in their order, each with its entry's name: c/canister.c's at the end of each
+        message, which for a method that calls another canister are the entry point's, then
+        those of this canister's methods that it called, if any, and of its callbacks (c/ic0.c).
+        The log ends with the line of `last`, by default `entry`, unless the message trapped: then
+        there is no line, unless `last` says otherwise (a callback that traps logs a cleanup
+        line, and the IC rejects the message)."""
         result = call(make_call)
         reached_end = result[0] == "reply" or result[1]["error_code"] == "CanisterRejectedMessage"
+        if last is None and reached_end:
+            last = entry
         lines, deadline = [], time.monotonic() + 10
         while True:
             lines += [line for id, line in self.server.log() if id == self.text_id]
-            if not reached_end or (lines and ENTRY_LINE.fullmatch(lines[-1])) or time.monotonic() > deadline:
+            m = ENTRY_LINE.fullmatch(lines[-1]) if lines else None
+            if last is None or (m and m[1] == last) or time.monotonic() > deadline:
                 break
             time.sleep(0.01)
-        m = ENTRY_LINE.fullmatch(lines[-1]) if lines else None
-        if reached_end and not (m and m[1] == entry):
-            raise RuntimeError(f"{self.name}: no log line for {entry} after {result}: {lines}")
-        measured = None
-        if m:
-            lines.pop()
-            measured = {"instructions": int(m[2]), "ic0.time calls": int(m[3])}
-            for part in (m[4] or "").split(", ") if m[4] else []:
-                what, n = part.rsplit(" ", 1)
-                measured[what] = int(n)
-        return result, lines, measured
+        if last is not None and not (m and m[1] == last):
+            raise RuntimeError(f"{self.name}: no log line for {last} after {result}: {lines}")
+        entries, others = [], []
+        for line in lines:
+            if m := ENTRY_LINE.fullmatch(line):
+                measured = {"instructions": int(m[2]), "ic0.time calls": int(m[3])}
+                for part in (m[4] or "").split(", ") if m[4] else []:
+                    what, n = part.rsplit(" ", 1)
+                    measured[what] = int(n)
+                entries.append((m[1], measured))
+            else:
+                others.append(line)
+        measured = next((e for name, e in entries if name == entry), None)
+        return result, others, measured, entries
 
     def install(self, mode):
         """Installs the module gzipped, which the IC accepts: in one message, which may have at
@@ -339,7 +361,7 @@ class Canister:
         start, refused = self.time(), 0
         while True:
             tried = self.time()
-            result, lines, measured = self._entry(
+            result, lines, measured, entries = self._entry(
                 lambda: self.pic.update_call_with_effective_principal(None, effective, "install_code", arg),
                 entry,
             )
@@ -356,31 +378,35 @@ class Canister:
             # More than one if the IC splits it into slices (deterministic time slicing).
             "rounds taken": self.time() - tried,
         }
-        # What the replica logs about the install, on PocketIC's standard output.
+        # What the replica logs about the install, on PocketIC's standard output: for an
+        # upgrade, canister_pre_upgrade's count as well.
+        entries_of_replica = [entry, "install_code"] + (["canister_pre_upgrade"] if mode == "upgrade" else [])
         replica, deadline = {}, time.monotonic() + 10
-        while len(replica) < 2 and time.monotonic() < deadline:
+        while len(replica) < len(entries_of_replica) and time.monotonic() < deadline:
             for line in self.server.stdout.new_lines():
-                if m := re.search(rf"Executing \({entry}\) on canister {self.text_id} consumed (\d+) instructions", line):
-                    replica[entry] = int(m[1])
+                if m := re.search(rf"Executing \((canister_pre_upgrade|{entry})\) on canister {self.text_id} consumed (\d+) instructions", line):
+                    replica[m[1]] = int(m[2])
                 if m := re.search(rf"Finished executing install_code message on canister {self.text_id} .*instructions consumed: ([\d_]+)$", line):
                     replica["install_code"] = int(m[1].replace("_", ""))
             time.sleep(0.01)
-        check(len(replica) == 2, f"{self.name}: the replica's log of the install is {replica}")
-        return {"log": lines, **measured, **rounds, "replica": replica}
+        check(sorted(replica) == sorted(entries_of_replica), f"{self.name}: the replica's log of the install is {replica}")
+        return {"log": lines, **measured, **rounds, "replica": replica, "entries": entries}
 
-    def query(self, method, args):
-        return self._method("query", method, args)
+    def query(self, method, args, last=None):
+        return self._method("query", method, args, last)
 
-    def update(self, method, args):
-        """An update call, which pocketic-py makes by executing rounds until it is done."""
-        return self._method("update", method, args)
+    def update(self, method, args, last=None):
+        """An update call, which pocketic-py makes by executing rounds until it is done: for a
+        method that calls another canister, until its callbacks have replied."""
+        return self._method("update", method, args, last)
 
-    def _method(self, kind, method, args):
+    def _method(self, kind, method, args, last=None):
         """Calls the method with `args`, a list of Python values of its argument types in the
         interface, which ic-py encodes, or bytes, which are sent as they are. The reply is
         decoded at the method's result types: the value of the result if there is one, such as
         a str for a text, an int for a nat, a list for a vec and a dict by field name for a
-        record, and None if there is none."""
+        record, and None if there is none. `last` is the entry line that ends the log, for a
+        method that calls another canister (see _entry)."""
         func = self.methods[method]
         check(("query" in func.annotations) == (kind == "query"),
               f"{method} is called as {kind}, but its type is {func.annotations}")
@@ -390,8 +416,8 @@ class Canister:
             payload = ic.encode([{"type": t, "value": v}
                                  for t, v in zip(func.argTypes, args, strict=True)])
         make_call = self.pic.query_call if kind == "query" else self.pic.update_call
-        result, lines, measured = self._entry(
-            lambda: make_call(self.id, method, payload), f"canister_{kind} {method}"
+        result, lines, measured, entries = self._entry(
+            lambda: make_call(self.id, method, payload), f"canister_{kind} {method}", last
         )
         outcome, value = result
         reply = None
@@ -405,6 +431,7 @@ class Canister:
             "reject_code": None if outcome == "reply" else value["reject_code"],
             "error_code": None if outcome == "reply" else value["error_code"],
             "log": lines,
+            "entries": entries,
             **(measured or {}),
         }
 
@@ -521,7 +548,8 @@ def check_initialized(canister, out, upgrade):
     initializers, so it takes as many instructions, part by part. One that skipped Canister.lean's
     initializer, which creates the notes, would take fewer, and the notes' reference would be a
     null pointer, which reads as an empty array: the address 0 is in the C stack, and readable."""
-    for part in ("instructions", "ic0.time calls", "constructors", "runtime", "module initializers"):
+    for part in ("instructions", "ic0.time calls", "constructors", "runtime", "module initializers",
+                 "task manager"):
         check(out[upgrade][part] == out["install"][part],
               f"{canister.name}: {upgrade}: canister_post_upgrade's {part} {out[upgrade][part]},"
               f" canister_init's {out['install'][part]}")
@@ -593,11 +621,141 @@ def measure_state(canister, out):
     expect("query", "notes", "5", [])
 
 
+def measure_calls(canister, other, out):
+    """The methods that call other canisters (see Canister.lean), after the second upgrade, with
+    no notes, and `other`, the other canister, installed. Sets out["calls"], the calls in their
+    order, each with the entry lines of its messages (see Canister._entry), and out["upgrade
+    with calls"], a third upgrade, after which canister_pre_upgrade has run."""
+    steps = out["calls"] = []
+    notes = []
+
+    def step(kind, method, args, last=None, text=None):
+        r = {"call": text or f"{method} ({', '.join(map(candid_text, args))})", "kind": kind,
+             **getattr(canister, kind)(method, args, last)}
+        steps.append(r)
+        return r
+
+    def expect(kind, method, args, reply, last=None, text=None):
+        r = step(kind, method, args, last, text)
+        check(r["reply"] == reply, f"{canister.name}: {r['call']}: {r} instead of the reply {reply!r}")
+        return r
+
+    def expect_notes(arg):
+        """`notes`, whose argument must be new (the query cache)."""
+        expect("query", "notes", [arg], notes)
+
+    def entries(r):
+        return [name for name, _ in r["entries"]]
+
+    # random: the reply comes from the management canister, in a later message.
+    randoms = []
+    for i in range(2):
+        r = step("update", "random", [], "reply callback", text=f"random () ({i + 1})")
+        check(r["reply"] is not None and len(r["reply"]) == 32, f"{canister.name}: {r['call']}: {r}")
+        check(entries(r) == ["canister_update random", "reply callback"], f"{canister.name}: {r['call']}: {r}")
+        randoms.append(bytes(r["reply"]))
+    check(randoms[0] != randoms[1], f"{canister.name}: random replied the same bytes twice: {randoms}")
+
+    # greet_via: a call to this canister, and to the other one. The callee's greet runs as a
+    # replicated query, in a message of its own, which logs its line in the callee's log.
+    r = expect("update", "greet_via", [canister.text_id, "self"], "Hello, self!", "reply callback",
+               text='greet_via (self, "self")')
+    check(r["log"] == [f"asking {canister.text_id} to greet self", "greeting self"]
+          and entries(r) == ["canister_update greet_via", "canister_query greet", "reply callback"],
+          f"{canister.name}: {r['call']}: {r}")
+    r = expect("update", "greet_via", [other.text_id, "other"], "Hello, other!", "reply callback",
+               text='greet_via (other, "other")')
+    check(r["log"] == [f"asking {other.text_id} to greet other"]
+          and entries(r) == ["canister_update greet_via", "reply callback"],
+          f"{canister.name}: {r['call']}: {r}")
+
+    # add_twice: the second call is made in the first's callback. add_both: both calls are made
+    # in the first message, and their replies come in either order.
+    r = expect("update", "add_twice", ["e"], [1, 2], "reply callback")
+    check(entries(r) == ["canister_update add_twice", "canister_update add", "reply callback",
+                         "canister_update add", "reply callback"], f"{canister.name}: {r['call']}: {r}")
+    notes += ["e/1", "e/2"]
+    expect_notes("c1")
+    r = step("update", "add_both", ["f", "g"], "reply callback")
+    check(sorted(r["reply"] or []) == [3, 4], f"{canister.name}: {r['call']}: {r}")
+    check(sorted(entries(r)) == sorted(["canister_update add_both", "canister_update add",
+                                        "canister_update add", "reply callback", "reply callback"])
+          and entries(r)[0] == "canister_update add_both" and entries(r)[-1] == "reply callback",
+          f"{canister.name}: {r['call']}: {r}")
+    notes += ["f", "g"] if r["reply"] == [3, 4] else ["g", "f"]
+    expect_notes("c2")
+
+    # call_raw: a reject by the callee (code 4), a method that does not exist (5), and a canister
+    # that does not exist (3), each with the reject message that the handler replies.
+    def expect_error(canister_text, method, arg, text):
+        r = step("update", "call_raw", [canister_text, method, list(arg)], "reject callback",
+                 text=text)
+        check(r["reply"] is not None and "Err" in r["reply"], f"{canister.name}: {r['call']}: {r}")
+        check(entries(r)[-1] == "reject callback", f"{canister.name}: {r['call']}: {r}")
+        return r["reply"]["Err"]
+
+    err = expect_error(canister.text_id, "add_then_throw", ic.encode([{"type": Types.Text, "value": "h"}]),
+                       'call_raw (self, "add_then_throw", ("h"))')
+    check(err == "call rejected: 4 - added h, then threw", f"{canister.name}: call_raw add_then_throw: {err!r}")
+    notes.append("h")
+    expect_notes("c3")
+    err = expect_error(canister.text_id, "nosuch", ic.encode([]), 'call_raw (self, "nosuch", ())')
+    check(err.startswith("call rejected: 5 - "), f"{canister.name}: call_raw nosuch: {err!r}")
+    err = expect_error(NOT_A_CANISTER, "greet", ic.encode([{"type": Types.Text, "value": "x"}]),
+                       f'call_raw ({NOT_A_CANISTER}, "greet", ("x"))')
+    check(err.startswith("call rejected: 3 - "), f"{canister.name}: call_raw to {NOT_A_CANISTER}: {err!r}")
+
+    # call_then_exit: the callback adds a note and exits, which traps; the IC discards that note
+    # and runs the cleanup callback, and rejects the message, as nothing can reply to it. The
+    # exit code is the number of notes that add replied.
+    r = step("update", "call_then_exit", ["i"], "cleanup callback")
+    check((r["reject_code"], r["error_code"]) == ("CanisterError", "CanisterCalledTrap")
+          and failure(r["reject"]) == f"ic0.trap: exit({len(notes) + 1})"
+          and entries(r) == ["canister_update call_then_exit", "canister_update add", "cleanup callback"],
+          f"{canister.name}: {r['call']}: {r}")
+    notes.append("i")
+    expect_notes("c4")
+    # call_then_throw: the callback throws, so serve rejects the message from it.
+    r = step("update", "call_then_throw", ["j"], "reply callback")
+    check((r["reject_code"], r["error_code"], r["reject"])
+          == ("CanisterReject", "CanisterRejectedMessage", f"added j as note {len(notes) + 1}, then threw")
+          and entries(r) == ["canister_update call_then_throw", "canister_update add", "reply callback"],
+          f"{canister.name}: {r['call']}: {r}")
+    notes.append("j")
+    expect_notes("c5")
+
+    # oneway_add: replies at once, and add runs after it, still in the round that pocketic-py
+    # executes for the update; its reply is dropped, by the IC, where the callback would run.
+    r = expect("update", "oneway_add", ["k"], None, "canister_update add")
+    check(entries(r) == ["canister_update oneway_add", "canister_update add"], f"{canister.name}: {r['call']}: {r}")
+    canister.pic.tick()
+    notes.append("k")
+    r = expect("query", "notes", ["c6"], notes)
+    check(entries(r) == ["canister_query notes"], f"{canister.name}: {r['call']}: {r}")
+
+    # call_in_query: ic0.call_new traps in a query.
+    r = step("query", "call_in_query", ["x"])
+    check(r["reject_code"] == "CanisterError" and "call_new" in r["reject"], f"{canister.name}: {r['call']}: {r}")
+
+    # No call is outstanding: the last callback said so, and canister_pre_upgrade, which traps
+    # while there are, lets a third upgrade through.
+    last = [e for e in steps[-5]["entries"] if e[0] == "reply callback"][-1][1]
+    check(last.get("outstanding calls") == 0, f"{canister.name}: after call_then_throw: {last}")
+    again = out["upgrade with calls"] = canister.install("upgrade")
+    check([name for name, _ in again["entries"]] == ["canister_pre_upgrade", "canister_post_upgrade"],
+          f"{canister.name}: the third upgrade logged {again['entries']}")
+    check_initialized(canister, out, "upgrade with calls")
+    expect("query", "notes", ["c7"], [])
+
+
 def measure_canisters(server, wasms, methods, expected_hello):
-    """Each module in a canister of its own, in one instance, which this deletes at the end."""
+    """Each module in a canister of its own, in one instance, which this deletes at the end. The
+    calls between them come after both are installed."""
     pic = pocket_ic(server)
     canisters = [Canister(server, pic, wasm, methods) for wasm in wasms]
     results = [measure(c, expected_hello) for c in canisters]
+    for i, (canister, out) in enumerate(zip(canisters, results)):
+        measure_calls(canister, canisters[(i + 1) % len(canisters)], out)
     pic.server.delete_instance(pic.instance_id)
     return results
 
@@ -705,6 +863,8 @@ def candid_text(value):
         return json.dumps(value)
     if isinstance(value, int):
         return str(value)
+    if isinstance(value, (bytes, bytearray)):
+        return "blob " + json.dumps(value.hex())
     if isinstance(value, list):
         return "vec { " + "; ".join(map(candid_text, value)) + " }" if value else "vec {}"
     if isinstance(value, dict):
@@ -721,6 +881,7 @@ def failure(message):
         (r"Canister exceeded the limit of \d+ instructions", "instruction limit"),
         (r"Canister trapped: (.*?)\.?\n", lambda m: f"trap: {m[1]}"),
         (r"Canister called `ic0.trap` with message: '(.*?)'", lambda m: f"ic0.trap: {m[1]}"),
+        (r"(?m)Canister violated contract: (.*?)\.?$", lambda m: f"contract violation: {m[1]}"),
     ]:
         if m := re.search(pattern, message):
             return gist if isinstance(gist, str) else gist(m)
@@ -764,11 +925,14 @@ def report(about, modules, results, wasmtime):
         ("    C++ constructors", lambda r: r["install"]["constructors"]),
         ("    Lean runtime", lambda r: r["install"]["runtime"]),
         ("    module initializers", lambda r: r["install"]["module initializers"]),
+        ("    task manager", lambda r: r["install"]["task manager"]),
         ("    ic0.time calls", lambda r: r["install"]["ic0.time calls"]),
         ("rounds that refused the first upgrade", lambda r: r["upgrade"]["refusing rounds"]),
         ("round that accepted it", lambda r: r["upgrade"]["accepted in round"]),
         ("rounds that it took", lambda r: r["upgrade"]["rounds taken"]),
         ("install_code (first upgrade)", lambda r: r["upgrade"]["replica"]["install_code"]),
+        ("  canister_pre_upgrade (replica)", lambda r: r["upgrade"]["replica"]["canister_pre_upgrade"]),
+        ("  canister_pre_upgrade", lambda r: next(e for n, e in r["upgrade"]["entries"] if n == "canister_pre_upgrade")["instructions"]),
         ("  canister_post_upgrade (replica)", lambda r: r["upgrade"]["replica"]["canister_post_upgrade"]),
         ("  canister_post_upgrade", lambda r: r["upgrade"]["instructions"]),
         ("install_code (second upgrade)", lambda r: r["upgrade again"]["replica"]["install_code"]),
@@ -841,6 +1005,62 @@ def report(about, modules, results, wasmtime):
                " same for the first access, which a query pays too: here for the pages that it"
                f" wrote before c/canister.c read the counter. {charges}. The difference is"
                " checked to be a multiple of the charge.", "  "))
+
+    heading("Calls")
+    print(fill("The methods that call other canisters (Canister.lean, Ic.lean), after the second"
+               " upgrade, with no notes. A method that calls returns after making the call, and"
+               " the rest of its handler runs in the message of the callback that brings the"
+               " response, which replies: the messages column has the messages of the call, in"
+               " the order in which they were logged, and the instruction columns their"
+               " instructions, as c/canister.c and c/ic0.c log them at their ends. A call to"
+               " this canister's own method is a message of its own, between them; a call to the"
+               " other canister's runs there. random calls the management canister's raw_rand,"
+               " and replies with its 32 bytes, which are the round's randomness, and so differ"
+               " between the two calls. call_then_exit's callback traps: the IC discards what it"
+               " changed, runs the cleanup callback, and rejects the message, as nothing can"
+               " reply to it. oneway_add's reply comes at once; the add that it calls runs"
+               " after, and its reply is dropped. call_in_query traps: a query cannot call."
+               " Each reply, reject, log and sequence of messages is checked, and the notes after"
+               " each step. Then a third upgrade, whose canister_pre_upgrade finds no call"
+               " outstanding.", "  "))
+    print()
+    rows = []
+    for i, step in enumerate(results[0]["calls"]):
+        if step["reject"] is None:
+            reply = step["reply"]
+            if step["call"].startswith("random"):
+                outcome = bytes(reply).hex()[:16] + "…"
+            elif isinstance(reply, dict):
+                outcome = "; ".join(f"{k} = {candid_text(v)}" for k, v in reply.items())
+                outcome = re.split(r"\\n|\n", outcome)[0]  # the first line, also of a message with a literal \n
+                if len(outcome) > 72:
+                    outcome = outcome[:72] + "…"
+            elif isinstance(reply, list) and step["call"].startswith("add_"):
+                outcome = "(" + ", ".join(map(candid_text, reply)) + ")"
+            else:
+                outcome = candid_text(reply)
+        elif step["error_code"] == "CanisterRejectedMessage":
+            outcome = f"rejected: {step['reject']}"
+        else:
+            outcome = f"trapped: {failure(step['reject'])}"
+        messages = ", ".join(name for name, _ in step["entries"])
+        cells = [f"{step['call']} ({step['kind']})", outcome, messages]
+        for r in results:
+            cells.append(" / ".join(number(e["instructions"]) for _, e in r["calls"][i]["entries"]))
+        rows.append(cells)
+    table(["call", "reply or outcome", "messages"] + names, rows, text=(0, 1, 2))
+    print()
+    print(fill("The instructions of each message of a call, in the messages' order, the"
+               " callbacks' among them. The third upgrade:", "  "))
+    print()
+    rows = []
+    for label, get in [
+        ("canister_pre_upgrade", lambda r: next(e for n, e in r["upgrade with calls"]["entries"] if n == "canister_pre_upgrade")["instructions"]),
+        ("canister_post_upgrade", lambda r: r["upgrade with calls"]["instructions"]),
+        ("install_code", lambda r: r["upgrade with calls"]["replica"]["install_code"]),
+    ]:
+        rows.append([label] + [number(get(r)) for r in results])
+    table([""] + names, rows)
 
     heading("Limits")
     text = ("The largest size at which each probe worked, and why it failed at the next size:"

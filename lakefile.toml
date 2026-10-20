@@ -29,9 +29,9 @@ globs = ["Candid.*"]
 [[lean_lib]]
 name = "lean-wasm"
 srcDir = "experiments/lean-wasm"
-roots = ["Hello"]
+roots = ["Hello", "Tasks"]
 
 [[lean_lib]]
 name = "lean-canister"
 srcDir = "experiments/lean-canister"
-roots = ["Ic0", "Probes", "Interface", "Canister", "RunProbe", "GenDid"]
+roots = ["Ic0", "Probes", "Interface", "Ic", "Canister", "RunProbe", "GenDid"]

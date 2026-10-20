@@ -107,6 +107,7 @@ wasi.stdenv.mkDerivation {
   patches = [
     ../runtime/wasi.patch
     ../runtime/string-to-list.patch
+    ../runtime/task-manager.patch
   ];
 
   postPatch = ''

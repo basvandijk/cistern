@@ -13,14 +13,17 @@ and updates. Its methods speak Candid, through this repository's [Candid library
 at the types of a [canister.did](canister.did) that is generated from the Lean types of their
 arguments and results. Its `hello` query replies exactly what `lean --run Hello.lean` prints.
 What its updates store in an `IO.Ref` stays from one message to the next, unless the update
-traps; a query's changes are discarded, and an upgrade starts afresh. With the IC's production
-limits:
+traps; a query's changes are discarded, and an upgrade starts afresh. Its updates call other
+canisters, this one, another, and the management canister's `raw_rand`, with Lean's
+`IO.Promise` and `Std.Async`, on a task manager that lean-wasm gave the runtime without
+threads: the response comes in a later message, in which the handler goes on, and replies. With
+the IC's production limits:
 
-- Installing takes 5.4 billion instructions of the 300 billion that an install may use, nearly
-  all of them for compiling the module. Lean's initialization in `canister_init` takes 3.4 million.
+- Installing takes 5.6 billion instructions of the 300 billion that an install may use, nearly
+  all of them for compiling the module. Lean's initialization in `canister_init` takes 4.3 million.
 - A query takes at least 0.26 million instructions of the 5 billion that it may use. Memory counts
   too: the IC charges 80,000 instructions for each 64 KiB page of memory that a message touches.
-- Candid doubled the instructions of `greet`: it takes 0.34 million, where it took 0.17 million
+- Candid doubled the instructions of `greet`: it takes 0.35 million, where it took 0.17 million
   with text arguments and replies. Part of that goes to the closed terms of the Candid code,
   constants that are computed when first used, 23 in `greet`, which each `greet` computes anew,
   as the IC discards what a query changes.
@@ -28,11 +31,16 @@ limits:
   that it may use, 0.24 million more than the same code as a query. That is the charge for the
   3 pages that it writes: an update pays as much again for the first write to a page. The first
   such update takes 0.58 million, as it also computes closed terms, which then stay.
-- The 5 MiB Wasm stack allows 16,378 to 109,198 levels of recursion for lean-wasm's probes. That is
-  as much as wasmtime allows with the same stack and Cranelift's optimizations off, and up to 29%
-  more than with its default optimizations, which lean-wasm's estimates used.
+- A call to another canister is at least two messages: `greet_via`, which calls `greet`, takes
+  0.64 million instructions for the message that makes the call and 0.55 million for the
+  callback that replies, and the callee's `greet` 0.30 million in between when it is this
+  canister. `random`, which calls `raw_rand`, takes 0.59 + 0.59 million. Calls added 5% to the
+  module and 28% to `canister_init`.
+- The 5 MiB Wasm stack allows 16,374 to 109,171 levels of recursion for lean-wasm's probes. That is
+  nearly as much as wasmtime allows with the same stack and Cranelift's optimizations off, and up
+  to 29% more than with its default optimizations, which lean-wasm's estimates used.
 - On non-ASCII text, `String.toUpper` takes about 4n² instructions for n characters, as Lean's
-  `String.map` is quadratic on such text. A query that builds a string of 34,965 such characters
+  `String.map` is quadratic on such text. A query that builds a string of 34,957 such characters
   and upper-cases it exceeds the limit of a query. On ASCII text `toUpper` takes 177 instructions
   per character.
 
@@ -40,9 +48,9 @@ The measurements come from the report of `lean-canister-report`, built on x86_64
 depths in wasmtime included. The exceptions are the modules' imports and exports, which
 wasm-objdump lists, the 12 WASI functions that the link keeps, where it places the data and how
 much code the Candid library has, which its map lists (`share/canister.map`), what is quoted from
-lean-wasm, the figures from before the methods spoke Candid, from that version's report, and
-those from before Canister.lean and its imports were module files, from that version's report and
-map. The IC's costs and limits come from its source (see [Sources](#sources)). Every step is a Nix
+lean-wasm, and the figures from earlier versions, from their reports: from before the methods
+could call other canisters, from before they spoke Candid, and from before Canister.lean and its
+imports were module files. The IC's costs and limits come from its source (see [Sources](#sources)). Every step is a Nix
 derivation that builds in the sandbox. PocketIC and wasmtime are deterministic, so
 `nix build --rebuild` reproduces the report bit for bit, as it does the modules.
 
@@ -52,6 +60,9 @@ derivation that builds in the sandbox. PocketIC and wasmtime are deterministic, 
 nix build .#lean-canister-report && cat result/report.txt   # the measurements, see below
 nix flake check                                             # also builds the report
 ```
+
+Calls to other canisters are in the report too: see [Calls](#calls) for how they work, and
+[Calls to other canisters](#calls-to-other-canisters) for what they cost.
 
 By hand, in the dev shell, which has `pocket-ic`, `wasmtime`, `lean`, and `python3` with
 pocketic-py:
@@ -72,21 +83,24 @@ Each step is a flake package:
 
 | Attribute              | Output                                                                     | Built by                                                   |
 | ---------------------- | -------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| `lean-canister-c`      | `Hello.c`, `Ic0.c`, `Probes.c`, `Interface.c`, `Canister.c` and `RunProbe.c`; `olean/`, the modules for `lean --run` | [nix/lean-c.nix](nix/lean-c.nix) |
+| `lean-canister-c`      | `Hello.c`, `Ic0.c`, `Probes.c`, `Interface.c`, `Ic.c`, `Canister.c` and `RunProbe.c`; `olean/`, the modules for `lean --run` | [nix/lean-c.nix](nix/lean-c.nix) |
 | `lean-canister-wasm`   | `bin/canister.wasm`; `bin/canister-opt.wasm`, after `wasm-opt -O`; `bin/run-probe.wasm`; `share/canister.map`, the link map | [nix/wasm.nix](nix/wasm.nix) |
 | `lean-canister-did`    | `canister.did`, the canister's Candid interface; `exports.txt`, the functions that canister.wasm must export | [nix/did.nix](nix/did.nix), [GenDid.lean](GenDid.lean) |
 | `lean-canister-report` | `report.txt`; `measurements.json`, everything that was measured            | [nix/measure.nix](nix/measure.nix), [measure.py](measure.py) |
 
 `lean-canister-c` and `lean-canister-did` need the Candid library's `.olean` files, its package
 `candid-c`, and `lean-canister-wasm` its `libCandid.a`, `candid-wasm` (see
-[candid/README.md](../../candid/README.md#building-and-testing)).
+[candid/README.md](../../candid/README.md#building-and-testing)), and lean-wasm's `libStd.a`,
+`lean-wasm-std`, the module `Std.Async.Basic` of Lean's `Std` library, for the calls.
 
 The check `lean-canister-runs` is the report. It fails to build if a module does not install or
 upgrade, if `greet` or `hello` replies wrongly, if `greet` does not reject the arguments that it
 does not take with the decoder's messages, if a probe's result is wrong, if the notes that the
-updates keep are not as the IC's rules predict, or if `add ("b")` as an update does not take a
+updates keep are not as the IC's rules predict, if `add ("b")` as an update does not take a
 whole number of page charges more than as a query (see
-[State across updates](#state-across-updates)). measure.py computes the
+[State across updates](#state-across-updates)), or if a call to another canister does not reply,
+reject, log or leave the notes as it should (see
+[Calls to other canisters](#calls-to-other-canisters)). measure.py computes the
 results, all but `repr`'s, which it takes from RunProbe.lean, run natively. The report and the
 check exist on
 x86_64-linux and aarch64-darwin, the systems for which ic-nix has PocketIC (see
@@ -100,9 +114,9 @@ system.
 ## How it works
 
 ```
-Hello, Ic0, Probes, Interface, Canister.lean ──lean -c──▶ *.c ──┐
-c/*.c: WASI on ic0, the Lean bindings, entry points ────────────┼─clang (wasm32)──▶ canister.wasm
-the Candid library (libCandid.a), Init and the Lean runtime ────┘
+Hello, Ic0, Probes, Interface, Ic, Canister.lean ──lean -c──▶ *.c ──┐
+c/*.c: WASI on ic0, the Lean bindings, entry points, callbacks ─────┼─clang (wasm32)──▶ canister.wasm
+Candid (libCandid.a), Std.Async.Basic (libStd.a), Init, the runtime ┘
 
 Probes.lean, RunProbe.lean, the same way, but a WASI program ──▶ run-probe.wasm
 
@@ -131,6 +145,10 @@ RunProbe.lean natively (lean --run) ┘
   the handler throws, it rejects the message with the error (see
   [Candid in the canister](#candid-in-the-canister)). So the handlers have the types of the
   methods: `greet`'s is a `String → IO String`, `probe`'s takes a `String × Nat × Option Nat`.
+  An update's handler is an `Ic.Async` action, in which it can call other canisters, as
+  `random`, `greet_via`, `add_twice`, `add_both`, `call_raw`, `call_then_exit`,
+  `call_then_throw` and `oneway_add` do, and the query `call_in_query` tries to (see
+  [Calls](#calls)).
 - `add` adds in place: `modifyGet` takes the array out of the reference while `push` runs, so
   that nothing else refers to it. That `push` does not copy the array relies on this runtime
   being built without threads. Lean takes a reference that `initialize` creates for one that
@@ -145,25 +163,33 @@ RunProbe.lean natively (lean --run) ┘
   (`deriving CandidType`), with the library's deriving handler, which Interface.lean imports with
   `meta import Candid.Derive`, for the meta phase only (see c/canister.c below). The entries are
   `abbrev`s, which Lean unfolds where Canister.lean looks for instances, so that there `greet.Args`
-  is `String`, with `String`'s instances. [GenDid.lean](GenDid.lean), a plain program, which
+  is `String`, with `String`'s instances, and `greet.kind` is `.query`, which decides the handler's
+  monad (see [Calls](#calls)). [GenDid.lean](GenDid.lean), a plain program, which
   nix/did.nix runs with `lean --run`, prints from the table the canister's Candid interface,
   [canister.did](canister.did), which is committed, and the names of the functions that
   canister.wasm must export, which c/canister.c defines by hand. The check `lean-canister-interface`
   ([nix/did.nix](nix/did.nix)) compares the committed canister.did with the printed one, and
   canister.wasm's exports, as wasm-objdump lists them, with the printed names.
+- [Ic.lean](Ic.lean) is what a handler calls other canisters with: `Ic.call`, `Ic.oneway`, the
+  errors, and `Ic.Async`, the monad of an update's handler, which is `Std.Async`'s `EAsync` with
+  those errors (see [Calls](#calls)).
 - [Probes.lean](Probes.lean) has the probes. [RunProbe.lean](RunProbe.lean) runs them as a
   program, for comparison: compiled like lean-wasm's `hello.wasm` and run under wasmtime, and
   natively.
-- [Ic0.lean](Ic0.lean) declares the System API functions that Canister.lean uses as `@[extern]`
-  functions, which [c/ic0.c](c/ic0.c) implements. Where the System API takes an address and a
-  size, they take a `ByteArray` or a `String`.
+- [Ic0.lean](Ic0.lean) declares the System API functions that Canister.lean and Ic.lean use as
+  `@[extern]` functions, which [c/ic0.c](c/ic0.c) implements. Where the System API takes an
+  address and a size, they take a `ByteArray` or a `String`, and a 128-bit value is a pair of
+  `UInt64`. `Ic0.call` makes a call to another canister with the `ic0.call_*` functions; c/ic0.c
+  also has the callbacks that the IC runs with the response (see [Calls](#calls)).
 - [c/canister.c](c/canister.c) has the entry points that the module exports. `canister_init`, and
   `canister_post_upgrade`, as an upgrade starts with new memory, do what a Lean program does
   before its `main`. They run the C++ constructors (`__wasm_call_ctors`), as crt1's `_start`
   would, and then, as Lean's generated `main` does, `runtime_initialize_Canister(1)`, which calls
   `lean_initialize_runtime_module()`, the runtime initializers of the imported modules and
   Canister.lean's own, which creates the notes. Then they call
-  `lean_io_mark_end_initialization()`. Canister.lean and its imports are module files (`module`),
+  `lean_io_mark_end_initialization()`, and `lean_init_task_manager_using(1)`, which creates the
+  task manager that the calls need (see [Calls](#calls)); `canister_pre_upgrade` refuses an
+  upgrade while calls are outstanding. Canister.lean and its imports are module files (`module`),
   as Init's and the Candid library's are, and for a module Lean generates
   `runtime_initialize_<Module>`, which initializes what the program needs when it runs, besides
   `initialize_<Module>`, which also initializes, through `meta_initialize_<Module>`, what Lean
@@ -178,7 +204,9 @@ RunProbe.lean natively (lean --run) ┘
   name of its own, as the IC refuses a module that exports a name as a query and as an update
   ([validation.rs][duplicate-export]). Those functions catch Lean's errors and reject the message
   with them, so a method replies or rejects, unless it traps: `add_then_exit` does, as it exits,
-  and so does a probe that runs out of stack or instructions.
+  and so does a probe that runs out of stack or instructions. A method that calls another
+  canister returns after making the call, and replies, or rejects, from the callback that brings
+  the response, in a later message.
 - [c/wasi.c](c/wasi.c) implements WASI on top of the System API, see below.
 - [nix/wasm.nix](nix/wasm.nix) compiles and links as lean-wasm does, with the Candid library's
   `libCandid.a` (`candid-wasm`) besides Init's and the runtime's libraries, and with three more
@@ -187,9 +215,9 @@ RunProbe.lean natively (lean --run) ┘
   not make every export run them too ([Writer.cpp][lld-writer]). `-Wl,--no-entry` keeps just the
   exports, and `-Wl,--fatal-warnings` is explained below. After the link, the build fails if the
   module imports anything that is not from `ic0`, or if the link map lists an initializer of the
-  meta phase of Canister, Interface or Candid.Derive (`meta_initialize_<Module>` or
-  `initialize_<Module>`), so that the deriving handler, which imports Lean, is not linked. It
-  also links `run-probe.wasm`, without the Candid library.
+  meta phase of Canister, Interface, Ic, Candid.Derive or Std.Async.Basic
+  (`meta_initialize_<Module>` or `initialize_<Module>`), so that the deriving handler, which
+  imports Lean, is not linked. It also links `run-probe.wasm`, without the Candid library.
 - [measure.py](measure.py) creates the canisters, installs the modules and calls them with
   [pocketic-py][pocketic-py], PocketIC's Python library, whose Candid comes from [ic-py][ic-py]
   ([nix/pocket-ic-py.nix](../../nix/pocket-ic-py.nix)). It reads the methods' types from
@@ -207,7 +235,12 @@ RunProbe.lean natively (lean --run) ┘
   `update_call_with_effective_principal`. Its `arg`, the canister's own argument, is the empty
   Candid sequence, `ic.encode([])`, which `canister_init` does not decode. It calls the canister's
   updates with pocketic-py's `update_call`, which submits the message and then executes rounds until
-  it is done. It also runs `run-probe.wasm` under wasmtime, and RunProbe.lean natively.
+  it is done, at most 100: for a method that calls another canister, until its callbacks have run
+  ([pocket_ic.py][pocketic-update-call]). After both canisters are installed, it tries the
+  methods that call (see [Calls to other canisters](#calls-to-other-canisters)): from each
+  canister's log it takes the lines of each message of a call, the entry point's, the callee's
+  methods' if the callee is the canister itself, and the callbacks'. It also runs
+  `run-probe.wasm` under wasmtime, and RunProbe.lean natively.
 
 ### WASI on ic0
 
@@ -268,6 +301,96 @@ that does not start with `DIDL`. The messages are in the Rust crate's words wher
 [candid/README.md](../../candid/README.md) describes the library: its types and functions, the
 decoder's limits, and how it is tested.
 
+### Calls
+
+A canister calls another with the System API: `ic0.call_new` names the callee, the method and
+two callbacks, `call_data_append` adds the argument, `call_perform` sends the call, and the
+response, the reply or a reject, comes in a later message, to the reply or the reject callback
+([interface specification][spec-call]). A callback is a function in the module's function table,
+given by its index, with an `env` value that the IC passes back; the original message is
+answered from whichever message finishes the work, with `ic0.msg_reply` in the callback as well
+as in the entry point, exactly once per call ([abstract behavior][abstract-callbacks]). If a
+callback traps, the IC discards what it changed, runs the cleanup callback, if one was given, on
+the memory as it was before, in a context in which it can neither reply nor call, and, once no
+call is outstanding and nothing has replied, rejects the original message with `CANISTER_ERROR`
+([abstract behavior][abstract-starvation]). Other messages run between a call and its callback:
+the canister's state may have changed. ic_cdk, the Rust CDK, resumes a Rust future in the
+callback, with a pointer to it as `env`, and on cleanup drops the futures without running them
+([call.rs][cdk-call]).
+
+Lean's idiom for a value that arrives later is a `Task`, and for one that something else
+provides an `IO.Promise`, and Lean's `Std.Async` library chains what follows an `await` onto the
+task, with `BaseIO.bindTask`, without blocking: its `EAsync` monad runs a computation up to its
+first await of a task that has not finished, and the rest when the task finishes
+([Std/Async/Basic.lean][std-async]; it imports only `Init`, and lean-wasm compiles it to
+`libStd.a`). So a call is a promise, and the callback resolves it:
+
+- [Ic.lean](Ic.lean): `Ic.Async α` is `EAsync Ic.Error α`, the monad of an update's handler;
+  `IO` lifts into it. `Ic.call canister "greet" name : Ic.Async String` encodes the arguments at
+  their Candid types, checks the canister's liquid cycles against `ic0.cost_call`, as ic_cdk does,
+  creates a promise, makes the call with `Ic0.call`, awaits the promise, and decodes the reply at
+  the expected type. A call is made when the action runs; `Std.Async.EAsync.concurrently` runs
+  two before awaiting either. The errors, `Ic.Error`: a reject, with its code (1 to 6, as the
+  specification numbers them) and message, `call_perform`'s refusal, too few cycles, a Candid
+  error, and an `IO` error; `Ic.oneway` makes a call whose response is dropped, and
+  `Ic.rawRand` calls the management canister's `raw_rand`. Calls wait for the response 300
+  seconds by default (`ic0.call_with_best_effort_response`, which may end in `SYS_UNKNOWN`), as
+  ic_cdk recommends for a callee one does not control; `Ic.Wait.unbounded` waits forever, which
+  keeps the canister from stopping.
+- `Ic.Handler e.kind` is the monad of the handler of the method `e`: `IO` for a query, in which
+  `Ic.call` does not typecheck, as a query cannot call, and `Ic.Async` for an update. So the
+  types of Canister.lean's handlers follow from Interface.lean, as before.
+- Canister.lean's `serve` starts the handler as an `Ic.Async` action, which runs it up to its
+  first pending await, and chains the reply, or the reject with the error, onto its task with
+  `BaseIO.chainTask`: at once, in the same message, if the handler did not await, as the methods
+  that do not call never do, and in the callback's message otherwise. The chain is kept alive by
+  the runtime (`BaseIO.chainTask` is `keep_alive`), not by `serve`, which returns to the IC.
+- [c/ic0.c](c/ic0.c): `cistern_ic0_call` assembles the call with the promise's address as `env`,
+  and the table indices of two functions of its own as the callbacks, `on_response` for the
+  reply and for a reject alike, which `ic0.msg_reject_code` tells apart, and `on_cleanup`. A
+  function's address is its table index on wasm32 (clang emits the index, and wasm-ld fills the
+  table, which the IC exports itself when it instruments the module;
+  [instrumentation.rs][export-table]). `on_response` makes an `Ic0.Response` of the code and
+  the reply or the reject message, with a function that Ic0.lean exports, and resolves the
+  promise, which runs the handler's continuation, up to its reply or its next call, before
+  `resolve` returns; then it releases the promise and logs the message's instructions, as the
+  entry points do. `on_cleanup` discards the promise, with `IO.Promise.discard`, which the
+  runtime patch adds: that resolves it with `none` and frees the continuation, and what it
+  captured, without running it, as resolving or releasing the promise would, and the
+  continuation can neither reply nor call there (ic_cdk drops its futures the same way). Then
+  it logs. c/ic0.c counts the calls whose callback has not run, which `canister_pre_upgrade`
+  checks.
+- The runtime: `IO.Promise` and `Task.bind` on a task that has not finished need a task manager,
+  which upstream's runtime without threads does not have, so lean-wasm's
+  [runtime/task-manager.patch](../lean-wasm/runtime/task-manager.patch) gives it one that runs
+  tasks on the one thread, from a queue, when they are made or when what they wait for is
+  resolved; `IO.wait` on a task that nothing resolves traps (see lean-wasm's
+  [Tasks and promises](../lean-wasm/README.md#tasks-and-promises)). `canister_init` creates it
+  after the initializers, as Lean's `main` does.
+
+What a handler that calls has to know:
+
+- Nothing after an await runs in the message that made the call: other messages run in between.
+  What a message changes stays when it returns, also when a later message of the handler throws or
+  traps: `call_then_throw`'s note stays, and so does `call_then_exit`'s first note, while the one
+  its callback adds is discarded with the trap. `IO.Ref`s are read anew after an await; a value
+  that a continuation captured is a snapshot.
+- Reply data that a message appended is discarded if it ends without `ic0.msg_reply`; `serve`
+  appends and replies in one message.
+- A trap in the callback leaves the original message without a reply: the IC rejects it, as
+  `call_then_exit` shows, with the trap's message.
+- `IO.wait`, `Task.get` and `EAsync.block` on a task that has not finished trap, with the
+  message of the runtime's internal panic. A promise that nothing resolves leaves the message
+  without a reply until the IC rejects it: the only way to suspend is to make a call.
+- A task made in one message and awaited by another method's handler would run that handler's
+  continuation in the first one's callback, and reply from it: a second reply, which traps. A
+  response belongs to the call context that made the call.
+- Upgrading while calls are outstanding delivers their responses to the new module, as calls to
+  table indices with `env`s in the memory that the upgrade discarded, which would corrupt the
+  canister; stopping the canister first, as `dfx deploy` does, waits for the responses
+  ([abstract behavior][abstract-stopping]). `canister_pre_upgrade` traps while calls are
+  outstanding, so that an upgrade without stopping fails instead.
+
 ### Measuring
 
 - `ic0.performance_counter(0)` is the number of instructions that the current message has
@@ -286,10 +409,13 @@ decoder's limits, and how it is tested.
   `fun n => let xs := List.range n; fun _ => ...` into one function of two arguments, which built
   the input in the measured part.
 - Each entry point that returns ends by logging its instructions, as in `canister_query greet:
-  342649 instructions, 23 ic0.time calls`; one that traps logs none. PocketIC prints the
-  canister's log on its standard error, where measure.py reads it. The count cannot include the
-  logging itself: for `canister_init`, the replica counts 12,663 instructions more. The replica
-  logs what each `install_code` took, but not what an update took.
+  342649 instructions, 23 ic0.time calls`; one that traps logs none. So does each callback, as in
+  `reply callback: 123456 instructions, 0 ic0.time calls (call context 234567, outstanding calls
+  0)`, where the call context is `ic0.performance_counter(1)`, the instructions of all of the
+  call's messages so far. PocketIC prints the canister's log on its standard error, where
+  measure.py reads it. The count cannot include the logging itself: for `canister_init`, the
+  replica counts 13,730 instructions more. The replica logs what each `install_code` took, but
+  not what an update took.
 - The replica answers a query that it has answered before from a cache, without running it,
   unless the entry has expired, the canister's version has changed, or the query read the time or
   the cycle balance and that has changed ([query_cache.rs][query-cache]). An update that traps
@@ -310,17 +436,24 @@ decoder's limits, and how it is tested.
 
 | Module              |     Bytes | Gzipped |
 | ------------------- | --------: | ------: |
-| `canister.wasm`     | 1,465,757 | 246,939 |
-| `canister-opt.wasm` | 1,033,711 | 196,134 |
+| `canister.wasm`     | 1,545,038 | 260,650 |
+| `canister-opt.wasm` | 1,093,691 | 207,023 |
 
 With text arguments and replies, canister.wasm had 1,017,382 bytes (166,549 gzipped). Speaking
-Candid makes it 448,375 bytes larger, 44% (gzipped 48%), most of that the Candid library's code:
-359,453 bytes in 402 functions (`share/canister.map`).
+Candid made it 448,375 bytes larger, 44% (gzipped 48%), most of that the Candid library's code:
+359,453 bytes in 402 functions (`share/canister.map`). Calling other canisters, with
+Std.Async.Basic, Ic.lean, the nine methods and their C, makes it 79,281 bytes larger, 5%
+(gzipped 13,711, 6%).
 
-The modules import 9 functions, all from `ic0`. They export `canister_init`,
-`canister_post_upgrade`, `canister_query greet`, `canister_query hello`, `canister_query probe`,
-`canister_update add`, `canister_query add_query`, `canister_update add_then_exit`,
-`canister_update add_then_throw`, `canister_query notes` and their memory. An ingress message
+The modules import 22 functions, all from `ic0`: 9 for the methods, and 13 for the calls (see
+[Calls](#calls)); the bindings that no method uses, such as `msg_caller`, are left out by the
+link. They export `canister_init`, `canister_pre_upgrade`, `canister_post_upgrade`,
+`canister_query greet`, `canister_query hello`, `canister_query probe`, `canister_update add`,
+`canister_query add_query`, `canister_update add_then_exit`, `canister_update add_then_throw`,
+`canister_query notes`, `canister_update random`, `canister_update greet_via`,
+`canister_update add_twice`, `canister_update add_both`, `canister_update call_raw`,
+`canister_update call_then_exit`, `canister_update call_then_throw`,
+`canister_update oneway_add`, `canister_query call_in_query` and their memory. An ingress message
 may have at most 2 MiB ([resource limits][limits]). The
 `install_code` message with canister.wasm would fit, as the module is less than three quarters of
 that size; gzipped, which the IC accepts ([interface specification][spec]), it is less than an
@@ -337,17 +470,22 @@ eighth, and measure.py installs both so. In PocketIC:
 - After an upgrade to the same module, which runs `canister_post_upgrade`, `greet` still works.
 - The notes that an update adds stay, unless the update traps or an upgrade comes between, and
   the queries see them (see [State across updates](#state-across-updates)).
+- The methods that call other canisters reply what the callee replied, in a later message, and
+  the errors as they should: a reject by the callee, a method or a canister that does not exist,
+  a callback that throws, and one that traps, after which the IC rejects the call and the
+  cleanup callback runs (see [Calls to other canisters](#calls-to-other-canisters)).
 
 ### Installation
 
 | Instructions                        | canister.wasm | canister-opt.wasm |
 | ----------------------------------- | ------------: | ----------------: |
-| `install_code`                      | 5,355,351,918 |     4,747,195,847 |
-| `canister_init`                     |     3,373,255 |         3,191,311 |
+| `install_code`                      | 5,634,658,436 |     5,006,345,802 |
+| `canister_init`                     |     4,308,706 |         4,070,198 |
 | of which C++ constructors           |       253,842 |           252,854 |
-| of which the Lean runtime           |        11,854 |            11,300 |
-| of which the modules' initializers  |     3,020,942 |         2,840,753 |
-| `install_code` of an upgrade        |    76,706,064 |        70,444,254 |
+| of which the Lean runtime           |        11,854 |            11,306 |
+| of which the modules' initializers  |     3,954,191 |         3,717,586 |
+| of which the task manager           |           685 |               555 |
+| `install_code` of an upgrade        |    80,755,476 |        74,235,974 |
 
 `install_code` is the replica's count for the whole message. `canister_init` is the counter at
 the end of `canister_init`, and `canister_post_upgrade` takes as many instructions, which
@@ -364,26 +502,32 @@ measure.py checks. There are two upgrades, one before and one after the updates 
   took 6,338,385,483 instructions. As module files, still with text, `canister_init` took
   2,239,940 instructions, 1,887,627 of them in the modules' initializers, with 192 `ic0.time`
   calls, and the install 3,496,678,603.
-- With the Candid library, `canister_init` takes 1,133,315 instructions more than with text, all
+- With the Candid library, `canister_init` took 1,133,315 instructions more than with text, all
   of them in the modules' initializers (canister-opt.wasm: 1,074,261 more, 1,074,241 of them
-  there and 20 in the Lean runtime), and makes 249 `ic0.time` calls instead of 192. The runtime
+  there and 20 in the Lean runtime), and made 249 `ic0.time` calls instead of 192. The runtime
   initializers of the library's modules and of Interface.lean compute their constants, and with
   them 57 more closed terms (see below). How the instructions divide among them was not measured.
   Of Interface.lean's constants, Canister.lean's code uses only `ProbeResult`'s instance. The
   others, the methods, the text of canister.did and the names of the exports, only GenDid.lean
   uses, but `runtime_initialize_Interface` computes them in the canister as well (`Interface.c`
   and `Canister.c` of `lean-canister-c`).
+- With the calls, `canister_init` takes 935,451 instructions more, 28% (canister-opt.wasm:
+  878,887), 933,249 of them in the modules' initializers, now also those of Std.Async.Basic and
+  Ic.lean, and of an Interface.lean with 17 methods instead of 8, and 685 for creating the task
+  manager; it makes 267 `ic0.time` calls instead of 249. Not divided further.
 - Compiling takes most of the install. The IC charges 20 million instructions for it, plus 6,000
   for each instruction of the module after it has instrumented the module for counting
   ([embedders.rs][embedders], [instrumentation.rs][instrumentation]). For canister.wasm that is
-  (5,355,351,918 - 3,385,918 - 20,000,000) / 6,000 = 888,661 instructions, where 3,385,918 is
+  (5,634,658,436 - 4,322,436 - 20,000,000) / 6,000 = 935,056 instructions, where 4,322,436 is
   the replica's count of `canister_init`. For a module that the subnet has installed since its
   last checkpoint, the 6,000 drop to 60 ([execution_environment.rs][compiled]), but the 20
   million remain ([hypervisor.rs][hypervisor]). A successful `install_code` records its module
   ([execution_environment.rs][compiled-wasms-insert]), which the next one looks up
   ([execution_environment.rs][compiled-wasms]), and a checkpoint forgets them
-  ([scheduler.rs][checkpoint]). So each upgrade took 3,386,404 for `canister_post_upgrade` +
-  20,000,000 + 60 × 888,661 = 76,706,064. An install may use 300
+  ([scheduler.rs][checkpoint]). So each upgrade took 329,186 for `canister_pre_upgrade` +
+  4,322,930 for `canister_post_upgrade`, the replica's counts (the canister's own count of
+  `canister_pre_upgrade` is 160,379: the replica charges it about twice that, for what was not
+  measured), + 20,000,000 + 60 × 935,056 = 80,755,476. An install may use 300
   billion instructions ([subnet_config.rs][subnet-config]), so this one uses 2%.
 - The IC charges the instructions of an `install_code` to the canister, and refuses the next one
   (`CanisterInstallCodeRateLimited`) until the rounds have paid them off, at 2 billion at the
@@ -395,10 +539,10 @@ measure.py checks. There are two upgrades, one before and one after the updates 
   a round in which it has nothing to execute ([canister_state.rs][must-be-in-schedule],
   [round_schedule.rs][schedule-retain]). So the IC refused the first upgrade in the 2 rounds after
   the install, and accepted it in the 3rd, on both modules. In PocketIC, each try took a round,
-  and so did the upgrade. It accepted the second upgrade at once: the first's 77 million
-  instructions (canister-opt.wasm: 70 million) were paid off at the end of its own round.
-- `canister_init` made 249 `ic0.time` calls, which cost at least 249 × 500 = 124,500
-  instructions, 4% of it. They come from Lean's lazily initialized constants (closed terms). The
+  and so did the upgrade. It accepted the second upgrade at once: the first's 81 million
+  instructions (canister-opt.wasm: 74 million) were paid off at the end of its own round.
+- `canister_init` made 267 `ic0.time` calls, which cost at least 267 × 500 = 133,500
+  instructions, 3% of it. They come from Lean's lazily initialized constants (closed terms). The
   first use of one takes a lock with `std::atomic<int>::wait` ([object.cpp][lean-once]), and
   libc++'s wait reads the clock before it first looks at the lock ([poll_with_backoff.h][libcxx]).
   That is `clock_time_get`, which c/wasi.c answers with `ic0.time`. A runtime without threads
@@ -408,17 +552,17 @@ measure.py checks. There are two upgrades, one before and one after the updates 
 
 | Instructions of the query                            | canister.wasm | canister-opt.wasm |
 | ---------------------------------------------------- | ------------: | ----------------: |
-| `greet ("world")`                                    |       342,649 |           336,967 |
-| `greet ("extra", 1)`: an extra argument              |       349,266 |           343,178 |
-| `hello (vec {})`                                     |       858,946 |           826,864 |
-| `hello (vec { "a"; "b" })`                           |       927,410 |           891,677 |
-| `probe ("noop", 0, null)`: no work, 286 measured     |       441,436 |           430,328 |
-| `probe ("noop", 0)`: no third argument               |       430,836 |           420,348 |
-| `greet` with the byte `0xff`: rejected, not Candid   |       256,275 |           255,536 |
-| `greet (1)`: rejected, a `nat`, not a `text`         |       291,752 |           288,848 |
-| `greet` with a `text` `0xff`: rejected, not UTF-8    |       281,537 |           279,219 |
-| `greet ()`: rejected, no argument                    |       276,549 |           274,736 |
-| `probe ("nosuch", 1, null)`: rejected, no such probe |       316,815 |           312,537 |
+| `greet ("world")`                                    |       348,840 |           342,645 |
+| `greet ("extra", 1)`: an extra argument              |       355,437 |           348,832 |
+| `hello (vec {})`                                     |       865,141 |           832,566 |
+| `hello (vec { "a"; "b" })`                           |       927,018 |           890,896 |
+| `probe ("noop", 0, null)`: no work, 286 measured     |       447,554 |           435,947 |
+| `probe ("noop", 0)`: no third argument               |       436,701 |           425,718 |
+| `greet` with the byte `0xff`: rejected, not Candid   |       259,794 |           258,740 |
+| `greet (1)`: rejected, a `nat`, not a `text`         |       295,216 |           291,990 |
+| `greet` with a `text` `0xff`: rejected, not UTF-8    |       284,828 |           282,185 |
+| `greet ()`: rejected, no argument                    |       280,593 |           278,462 |
+| `probe ("nosuch", 1, null)`: rejected, no such probe |       322,399 |           317,676 |
 
 These are the counts that the entry point logs, so they leave out the logging (see
 [Measuring](#measuring)). The calls are in Candid's text format. measure.py encodes the
@@ -438,11 +582,13 @@ nosuch`. `greet ("extra", 1)` replies `("Hello, extra!")`: the extra argument is
 `probe ("noop", 0)` runs the probe once, as the decoder makes the missing `opt nat` `null`.
 
 Candid doubled the instructions of `greet`. With text arguments and replies, `greet "world"` took
-169,607 (canister-opt.wasm: 169,247); `greet ("world")` takes 173,042 more, 102% (canister-opt.wasm:
+169,607 (canister-opt.wasm: 169,247); `greet ("world")` took 173,042 more, 102% (canister-opt.wasm:
 167,720, 99%). The difference goes to decoding the argument and encoding the reply, where the
 text protocol only converted between bytes and a `String`, and to the charges for the memory
-that these touch; how it divides was not measured. `hello` takes 102,555 more without arguments,
-and 119,603 more with `a` and `b`. These queries also make `ic0.time` calls, which cost at least
+that these touch; how it divides was not measured. `hello` took 102,555 more without arguments,
+and 119,603 more with `a` and `b`. Since the handlers run through `Std.Async`'s monad (see
+[Calls](#calls)), `greet ("world")` takes 6,191 more, 2% (canister-opt.wasm: 5,678), and `hello`
+6,195 more. These queries also make `ic0.time` calls, which cost at least
 500 instructions each: `greet ("world")` 23, where `greet` made none with text, and `hello` 37,
 where it made 12. Each comes from a closed term that the query initializes (see
 [Installation](#installation)), now also of the code that decodes and encodes, and that the next
@@ -453,7 +599,7 @@ least 11,500 instructions of `greet`'s difference are the IC's charges for `ic0.
 The measured work of the `noop` probe takes 286 instructions. The rest of its query goes to the
 entry point, to decoding the argument and encoding the reply, and to the charges for the memory
 that these touch. How it divides was not measured; [Memory pages](#memory-pages) shows the
-charges in the probes. With text arguments, this query took 188,012 instructions, 253,424 fewer.
+charges in the probes. With text arguments, this query took 188,012 instructions, 259,542 fewer.
 Before Canister.lean and its imports were module files (see [Installation](#installation)), it
 took 428,012, exactly 240,000 more, the charge for 3 more pages that it touched. Without the meta
 phase, the initializers create fewer objects, and the module's data (`.rodata`, `.data` and
@@ -470,17 +616,17 @@ argument of its own, `"1"` to `"5"`, which it ignores (see [Measuring](#measurin
 
 | Call, in this order                         | Reply or outcome                | canister.wasm | canister-opt.wasm | `ic0.time` calls |
 | ------------------------------------------- | ------------------------------- | ------------: | ----------------: | ---------------: |
-| `add ("a")` (update)                        | `1`                             |       577,982 |           572,461 |               24 |
-| `add_query ("b")` (query)                   | `2`                             |       286,867 |           284,044 |                0 |
-| `notes ("1")` (query)                       | `vec { "a" }`                   |       315,623 |           311,211 |                7 |
-| `add ("b")` (update)                        | `2`                             |       526,867 |           524,044 |                0 |
-| `notes ("2")` (query)                       | `vec { "a"; "b" }`              |       321,901 |           317,175 |                7 |
+| `add ("a")` (update)                        | `1`                             |       584,225 |           578,210 |               24 |
+| `add_query ("b")` (query)                   | `2`                             |       292,834 |           289,531 |                0 |
+| `notes ("1")` (query)                       | `vec { "a" }`                   |       321,458 |           316,569 |                7 |
+| `add ("b")` (update)                        | `2`                             |       532,834 |           529,531 |                0 |
+| `notes ("2")` (query)                       | `vec { "a"; "b" }`              |       327,847 |           322,644 |                7 |
 | `add_then_exit ("c")` (update)              | trap: `exit(3)`                 |               |                   |                  |
-| `notes ("3")` (query)                       | `vec { "a"; "b" }`              |       321,901 |           317,175 |                7 |
-| `add_then_throw ("d")` (update)             | reject: `added d, then threw`   |       513,770 |           511,821 |                1 |
-| `notes ("4")` (query)                       | `vec { "a"; "b"; "d" }`         |       328,514 |           323,474 |                7 |
-| second upgrade: `canister_post_upgrade`     | accepted at once                |     3,373,255 |         3,191,311 |              249 |
-| `notes ("5")` (query)                       | `vec {}`                        |       354,686 |           348,278 |               26 |
+| `notes ("3")` (query)                       | `vec { "a"; "b" }`              |       327,847 |           322,644 |                7 |
+| `add_then_throw ("d")` (update)             | reject: `added d, then threw`   |       519,565 |           517,147 |                1 |
+| `notes ("4")` (query)                       | `vec { "a"; "b"; "d" }`         |       334,453 |           328,936 |                7 |
+| second upgrade: `canister_post_upgrade`     | accepted at once                |     4,308,706 |         4,070,198 |              267 |
+| `notes ("5")` (query)                       | `vec {}`                        |       360,126 |           353,227 |               26 |
 
 The `ic0.time` calls were the same on both modules.
 
@@ -513,10 +659,10 @@ for its first write to a 64 KiB page as for its first access, which a query pays
 code, the objects that `add` allocates, the notes among them, and also the C stack, which lies in
 memory, unlike the Wasm stack, the allocator's state and buffers, which lie in the module's data
 (see [Queries](#queries)). With text arguments, `add "b"` took 324,714 instructions and
-`add_query "b"` 164,714, 2 pages apart. So Candid adds 202,153 to the update and 122,153 to the
-query, and the 80,000 between them are the third page that the update writes.
+`add_query "b"` 164,714, 2 pages apart. So Candid and `Std.Async` add 208,120 to the update and
+128,120 to the query, and the 80,000 between them are the third page that the update writes.
 
-The first `add` took 51,115 instructions more than the second (canister-opt.wasm: 48,417). With
+The first `add` took 51,391 instructions more than the second (canister-opt.wasm: 48,679). With
 text arguments, when the first copied the empty array but initialized no closed terms, the
 difference was 157 (canister-opt.wasm: 139). Now the first made 24 `ic0.time` calls, and the
 second none: the first initialized 24 closed terms, of the code that decodes and encodes, and
@@ -525,6 +671,72 @@ ready as well. Each `notes` query made 7 calls, for closed terms that `add` had 
 which each query initializes anew; after the second upgrade, which starts with new memory,
 `notes ("5")` made 26. `add_then_throw ("d")` made 1.
 
+### Calls to other canisters
+
+The methods that call (see [Calls](#calls)), tried after the second upgrade, with no notes, from
+each canister, with the other one installed. A call is several messages: the entry point's,
+which makes the call and returns, the callee's method, which is a message of this canister's
+own when it calls itself, and the callback's, which runs the rest of the handler and replies.
+The instructions of each, as c/canister.c and c/ic0.c log them, in the messages' order
+(canister.wasm; canister-opt.wasm's are up to 2% less, and are in the report), and the
+`ic0.time` calls of the first ones:
+
+| Call, in this order                        | Reply or outcome                                             | Messages                                                  | Instructions                                    |
+| ------------------------------------------ | ------------------------------------------------------------ | --------------------------------------------------------- | ----------------------------------------------- |
+| `random ()`                                | 32 bytes                                                     | `random`, reply callback                                  | 590,013 / 591,292 (8 and 20 `ic0.time` calls)   |
+| `random ()` again                          | 32 other bytes                                               | `random`, reply callback                                  | 537,869 / 561,964                               |
+| `greet_via (self, "self")`                 | `"Hello, self!"`                                             | `greet_via`, `greet`, reply callback                      | 644,401 / 299,680 / 547,628                     |
+| `greet_via (other, "other")`               | `"Hello, other!"`                                            | `greet_via`, reply callback                               | 634,348 / 548,498                               |
+| `add_twice ("e")`                          | `(1, 2)`                                                     | `add_twice`, `add`, reply callback, `add`, reply callback | 575,632 / 536,941 / 575,087 / 532,719 / 556,371 |
+| `add_both ("f", "g")`                      | `(3, 4)`                                                     | `add_both`, `add`, `add`, reply callback, reply callback  | 644,669 / 532,705 / 532,583 / 521,036 / 556,377 |
+| `call_raw (self, "add_then_throw", ("h"))` | `Err "call rejected: 4 - added h, then threw"`               | `call_raw`, `add_then_throw`, reject callback             | 598,462 / 519,022 / 586,121                     |
+| `call_raw (self, "nosuch", ())`            | `Err "call rejected: 5 - IC0536: … no update method 'nosuch'…"` | `call_raw`, reject callback                            | 580,050 / 616,952                               |
+| `call_raw (2vxsx-fae, "greet", ("x"))`     | `Err "call rejected: 3 - No route to canister 2vxsx-fae"`    | `call_raw`, reject callback                               | 579,925 / 587,705                               |
+| `call_then_exit ("i")`                     | rejected by the IC: `ic0.trap: exit(6)`                      | `call_then_exit`, `add`, cleanup callback                 | 570,976 / 532,673 / 492,456                     |
+| `call_then_throw ("j")`                    | reject: `added j as note 7, then threw`                      | `call_then_throw`, `add`, reply callback                  | 570,274 / 533,326 / 529,732                     |
+| `oneway_add ("k")`                         | `()`                                                         | `oneway_add`, `add`                                       | 569,246 / 533,346                               |
+| `call_in_query ("x")` (query)              | trap: `"ic0_call_new" cannot be executed in non replicated query mode` | | |
+| third upgrade                              | `canister_pre_upgrade`, then `canister_post_upgrade`         |                                                           | 160,379, then 4,308,706                         |
+
+- `random` replies 32 bytes, which differ between the two calls: PocketIC's randomness is the
+  round's. The first call initializes closed terms, 8 in the entry point and 20 in the callback,
+  which stay, as an update's changes do: the second call makes no `ic0.time` call. Nor do the
+  calls after it, except where a method runs for the first time.
+- `greet_via` of this canister runs `greet` as a message of its own, 299,680 instructions, which
+  logs its `greeting self` as any `greet` does (as a replicated query: its changes are
+  discarded). Of the other canister, the callee's message is in that canister's log, and does
+  not count here.
+- `add_twice` makes its second call in the first callback: five messages. `add_both` makes both
+  in the first: both `add`s run before either callback, and the replies come in the order of the
+  calls here, `(3, 4)`. The notes have `e/1`, `e/2`, `f` and `g` afterwards.
+- `call_raw` with a method that rejects, with one that does not exist, and with a principal that
+  is no canister gets the reject codes 4, 5 and 3 (see [Calls](#calls)), with the IC's messages,
+  and replies them as an `Err`; `h`'s note stays, as a reject keeps the callee's changes. The
+  reject callback of the `nosuch` call takes 616,952 instructions, more than a reply callback:
+  the message is long.
+- `call_then_exit` adds `i`, then in the callback adds `i/callback` and exits: the IC discards
+  the second note with the trap, runs the cleanup callback, 492,456 instructions, which discards
+  the handler's continuation and logs (without the discarding, in an earlier version, it took
+  323,595), and rejects the call, with `CANISTER_ERROR` and the trap's message, `exit(6)`, 6
+  being `add`'s reply. The next `notes` has `i`, but not `i/callback`.
+- `call_then_throw` adds `j` and throws in the callback: `serve` rejects from there, with the
+  error's message, and the note stays.
+- `oneway_add` replies at once, and `add` runs after it, in the same round: `k` is there at the
+  next query. The response's callback, an index that the table does not have, traps where the IC
+  would run it, which the canister does not see.
+- `call_in_query` traps, as the System API refuses `call_new` in a query, with that message,
+  which the IC passes on as the query's reject.
+- Each callback found no call outstanding at its end, which the last one logs, and the third
+  upgrade's `canister_pre_upgrade`, which would trap otherwise, took 160,379 instructions.
+
+A message that makes a call costs about as much as `add` without a call, 0.53 million, plus
+what the call's data takes; the callback, which decodes the reply, encodes the handler's reply
+and replies, about as much as an update: 0.52 to 0.62 million. Of the callback's instructions,
+the page charges are not separated out; `ic0.performance_counter(1)` counts the whole call
+context, 1.2 million for `greet_via` of this canister, and 1.7 million for `add_twice` and
+`add_both`. Nothing here was measured for a call across subnets, or with a response that times
+out.
+
 ### Recursion depth
 
 The largest depth that worked, for the probes of lean-wasm (see
@@ -532,22 +744,23 @@ The largest depth that worked, for the probes of lean-wasm (see
 
 | Probe                                   | lean-wasm | wasmtime | wasmtime, opt-level 0 | PocketIC | PocketIC, canister-opt.wasm |
 | --------------------------------------- | ------: | ------: | ------: | ------: | ------: |
-| `deep n`                                | 100,000 | 109,203 | 109,205 | 109,198 | 109,201 |
-| `(countM n).run 0`                      |  50,000 |  65,519 |  81,902 |  81,896 |  81,898 |
-| `toString (repr (List.range n))`        |  10,000 |  18,196 |  23,396 |  23,394 |  23,395 |
-| `xs.zip xs`, where `xs := List.range n` |  20,000 |  46,800 |  54,602 |  54,597 |  46,799 |
-| `deepK n id`                            |  10,000 |  15,599 |  16,379 |  16,378 |  16,379 |
-| `deepKB n id`                           |  10,000 |  15,599 |  16,379 |  16,378 |  16,379 |
+| `deep n`                                | 100,000 | 109,203 | 109,205 | 109,171 | 109,182 |
+| `(countM n).run 0`                      |  50,000 |  65,519 |  81,902 |  81,876 |  81,884 |
+| `toString (repr (List.range n))`        |  10,000 |  18,196 |  23,396 |  23,388 |  23,391 |
+| `xs.zip xs`, where `xs := List.range n` |  20,000 |  46,800 |  54,602 |  54,584 |  46,791 |
+| `deepK n id`                            |  10,000 |  15,599 |  16,379 |  16,374 |  16,376 |
+| `deepKB n id`                           |  10,000 |  15,599 |  16,379 |  16,374 |  16,376 |
 
 lean-wasm tried only the depths 1,000, 2,000, 5,000, 10,000, and so on, under wasmtime with its
 default optimizations. The other columns come from the report, by bisection. In PocketIC, the
 next depth failed with "Canister trapped: stack overflow"; under wasmtime, `run-probe.wasm` ran
 out of stack ("call stack exhausted"). The IC compiles canisters with Cranelift's optimizations
 off ([validation.rs][validation], [wasmtime_embedder.rs][execution-config]), and PocketIC's
-depths come within 7 levels of wasmtime's then.
+depths come within 34 levels of wasmtime's then (within 7, before the canister could call: the C
+stack in linear memory has a little more on it now).
 So the code that the IC adds to count instructions hardly costs depth. With its default
 optimizations, which lean-wasm used, wasmtime allows up to 22% less (`repr`; `countM` 20%). After
-`wasm-opt -O`, the depth of `zip` drops to 46,799, one level less than wasmtime allows with its
+`wasm-opt -O`, the depth of `zip` drops to 46,791, below the 46,800 that wasmtime allows with its
 optimizations.
 
 ### Instructions of Lean code
@@ -559,17 +772,17 @@ measure.py tries: the 1-2-5 series, and for `toUpper` 10,000, 20,000, 40,000 and
 | Probe                           | Size          |    Instructions | Per level or element |
 | ------------------------------- | ------------- | --------------: | -------------------: |
 | `deep n`                        | 100,000       |       5,800,307 |                   58 |
-| `(countM n).run 0`              | 50,000        |       4,450,655 |                   89 |
-| `deepK n id`                    | 10,000        |       6,071,451 |                  607 |
+| `(countM n).run 0`              | 50,000        |       4,450,769 |                   89 |
+| `deepK n id`                    | 10,000        |       6,071,734 |                  607 |
 | `xs.zip xs`                     | 50,000        |      48,345,834 |                  967 |
-| `deepKB n id`                   | 10,000        |      32,855,397 |                3,286 |
-| `toString (repr xs)`            | 20,000        |     391,585,990 |               19,579 |
-| `s.toUpper`, ASCII              | 1,280,000     |     226,561,682 |                  177 |
-| `s.toUpper`, U+0100–U+01FF      | 20,000        |   1,634,480,250 |               81,724 |
+| `deepKB n id`                   | 10,000        |      32,855,503 |                3,286 |
+| `toString (repr xs)`            | 20,000        |     391,585,956 |               19,579 |
+| `s.toUpper`, ASCII              | 1,280,000     |     226,561,808 |                  177 |
+| `s.toUpper`, U+0100–U+01FF      | 20,000        |   1,635,740,313 |               81,787 |
 
 Preparing the input is not counted: `List.range n` for `repr` and `zip`, and the string for
 `toUpper`. Building the string costs more than upper-casing it in ASCII: its query takes
-1,942,448,485 instructions in all.
+1,942,455,523 instructions in all.
 
 ### `String.map` exceeds the limit of a query
 
@@ -577,9 +790,9 @@ On non-ASCII text, Lean's `String.map`, and with it `toUpper`, copies the whole 
 character (see [lean-wasm's README](../lean-wasm/README.md#stringmap-is-quadratic-on-non-ascii-text)),
 twice ([object.cpp][lean-utf8-set]). With 2 bytes per character in UTF-8 and an instruction per
 byte that `memory.copy` copies ([instrumentation.rs][instrumentation]), that is about 4n²
-instructions for n characters: 1.6 billion for 20,000, as measured (1,634,480,250). By 4n², the
+instructions for n characters: 1.6 billion for 20,000, as measured (1,635,740,313). By 4n², the
 limit of 5 billion instructions for a query would allow about 35,000 characters (35,355).
-Bisection found that `toUpper` worked at 34,964 and failed at 34,965: the query does more that
+Bisection found that `toUpper` worked at 34,956 and failed at 34,957: the query does more that
 grows with the string, such as building it. lean-wasm timed 40,000 characters at 100 ms under
 wasmtime. An update may use 40 billion instructions ([subnet_config.rs][subnet-config]),
 which by 4n² would allow about 100,000 characters (not measured).
@@ -593,15 +806,16 @@ memory pages or initialized closed terms, which the second finds ready (canister
 | ------------------------ | ----------: | ----------: | ---------: |
 | `deep 1,000`             |      58,307 |      58,307 |          0 |
 | `zip 1,000`              |     968,874 |     888,354 |     80,520 |
-| `repr 1,000`             |  18,896,313 |  18,646,111 |    250,202 |
-| `deepKB 1,000`           |   3,270,677 |   3,162,228 |    108,449 |
-| `toUpper 10,000`         |   1,771,682 |   1,771,682 |          0 |
+| `repr 1,000`             |  18,896,279 |  18,646,111 |    250,168 |
+| `deepKB 1,000`           |   3,270,783 |   3,162,274 |    108,509 |
+| `toUpper 10,000`         |   1,771,808 |   1,771,682 |        126 |
 | `toUpperNonAscii 10,000` | 417,870,313 | 417,240,250 |    630,063 |
 
 `deep` uses only the Wasm stack, which is not memory that the IC charges for. For `zip`, the
 difference is about the charge for one page. The counts of a first run therefore depend on where
-in memory the allocator places objects: `toUpperNonAscii 10,000` took 417,240,250 instructions
-in a query of its own, and 417,870,313 in its first run here.
+in memory the allocator places objects: before the canister could call, `toUpper 10,000` took
+the same in both runs, and `toUpperNonAscii 10,000` took 417,240,250 instructions in a query of
+its own, where it takes 417,870,313 now, as in its first run here.
 
 ### wasm-opt
 
@@ -613,8 +827,8 @@ up to 4% and the probes up to 6% fewer. The depth of `zip` drops by 14%.
 
 1. **Candid, what remains.** The methods speak Candid (see
    [Candid in the canister](#candid-in-the-canister)), but a CDK needs more of it. A `func` or
-   `service` reference cannot be called: a call to another canister takes the System API's
-   `ic0.call_*` functions, and its reply comes in a later message (see 6). The generated
+   `service` reference is a value, but not yet a thing to call: `Ic.call` takes a principal and
+   a method name (see [Calls](#calls)). The generated
    canister.did inlines every type, as `deriving CandidType` makes no named type definitions,
    which also means that it cannot derive a recursive type yet. The module has no custom section
    `icp:public candid:service`, in which the specification recommends that a canister publish its
@@ -659,10 +873,11 @@ up to 4% and the probes up to 6% fewer. The depth of `zip` drops by 14%.
    instructions for each closed term that a query initializes, 11,500 in `greet` (see
    [Queries](#queries)). Patching the runtime's `lock_simple_atomic`, or caching `ic0.time` per
    message in c/wasi.c, would save that.
-6. **Randomness and asynchronous calls.** `random_get` gives the same bytes in every canister. Real
-   randomness comes from `raw_rand`, which, like any call to another canister, replies in a
-   later message. As lean-wasm found, `IO.Promise` does not work without a task manager.
-7. **Memory charges.** A query that does nothing, `probe ("noop", 0, null)`, takes 0.44 million
+6. **Randomness.** `random_get` gives the same bytes in every canister, so `IO.rand` is not
+   random. `random` gets real randomness from the management canister's `raw_rand`, with a call
+   (see [Calls](#calls)); a canister that wants `IO.rand` to be random would seed c/wasi.c's
+   generator from it, in a message of its own, as `canister_init` cannot call.
+7. **Memory charges.** A query that does nothing, `probe ("noop", 0, null)`, takes 0.45 million
    instructions. How much of that is the charge for memory pages was not measured; reading
    `ic0.performance_counter` at points within a query would show it. An update pays for the
    pages that it writes as well: `add` 240,000 instructions for 3 pages (see
@@ -670,11 +885,11 @@ up to 4% and the probes up to 6% fewer. The depth of `zip` drops by 14%.
    The counts of Lean code depend on where objects lie. The
    runtime allocates every object with wasi-libc's `malloc`; an allocator that keeps a message's
    objects on fewer pages could take fewer instructions.
-8. **Compilation.** Compiling takes 6,000 instructions per instruction of the module, 5.4 billion
+8. **Compilation.** Compiling takes 6,000 instructions per instruction of the module, 5.6 billion
    for this one. Init accounts for half of the code of a hello world (see lean-wasm), and the
-   Candid library for 29% of this module's (`share/canister.map`); a module that imports less of
-   them would install for less. Installing the module again, in an upgrade, a reinstall or
-   another canister, costs 20 million plus a hundredth of the rest, 73 million, but only until
+   Candid library for about 30% of this module's (`share/canister.map`); a module that imports
+   less of them would install for less. Installing the module again, in an upgrade, a reinstall
+   or another canister, costs 20 million plus a hundredth of the rest, 76 million, but only until
    the subnet's next checkpoint.
 9. **Mainnet.** On the IC, `ic0.debug_print` adds to the canister's log, which keeps 4 KiB by
    default, and the replica prints nothing. A non-replicated query's log is discarded. An
@@ -683,6 +898,17 @@ up to 4% and the probes up to 6% fewer. The depth of `zip` drops by 14%.
    convenience, but those of the updates reach the canister's log.
 10. **macOS.** The report on aarch64-darwin is untested, and its page charges would differ (see
     [Measuring](#measuring)), as may its depths under wasmtime.
+11. **Calls, what remains.** After a callback trapped, the cleanup callback frees the
+    continuation that waited on the call (see [Calls](#calls)), but a task of the chain that
+    something else still refers to stays allocated, as a task that never finishes; what remains
+    is small. The outstanding calls are a counter: a task that a handler made and another
+    handler awaits is not detected (see [Calls](#calls)), as Motoko's scoped await and ic_cdk
+    0.19 detect it.
+    Nothing calls from a composite query, a timer or a heartbeat, which can call too, and whose
+    callbacks must not reply; nothing attaches cycles to a call, though `Ic.Call.cycles` does,
+    nor accepts them. A handler cannot reply before it awaits. `SYS_UNKNOWN`, the reject of a
+    bounded-wait call that timed out, was not produced in PocketIC. And the `Ic.Async` monad
+    comes from `Std.Async`, which Lean 4.34.1 marks internal: its names may change.
 
 ## Sources
 
@@ -737,6 +963,17 @@ lean-wasm cites.
     messages
 30. [The system state tree][state-tree], a section of the IC interface specification's main page:
     the custom section `icp:public candid:service`
+31. [The canister interface][spec-call], its section on inter-canister calls: `ic0.call_*`, the
+    callbacks, `call_perform`'s codes, best-effort responses
+32. [The abstract behavior][abstract-callbacks]: how a callback and its cleanup run;
+    [starvation][abstract-starvation]: the reject when nothing can reply; [stopping][abstract-stopping]:
+    a canister stops when it has no open call contexts
+33. [call.rs][cdk-call] of cdk-rs, the Rust CDK (commit 070233b): the call builder, the
+    callback and cleanup trampolines, and the errors that `Ic.Error` mirrors
+34. [instrumentation.rs][export-table]: the IC exports the module's function table itself
+35. [object.cpp][lean-task-manager]: Lean's task manager, which lean-wasm's patch makes work
+    without threads, and [Std/Async/Basic.lean][std-async]: the `EAsync` monad (Lean 4.34.1)
+36. [pocket_ic.py][pocketic-update-call] of pocketic-py: `update_call` executes at most 100 rounds
 
 [limits]: https://docs.internetcomputer.org/references/resource-limits.md
 [spec]: https://docs.internetcomputer.org/references/ic-interface-spec/canister-interface.md
@@ -788,3 +1025,12 @@ lean-wasm cites.
 [candid-spec]: https://github.com/dfinity/candid/blob/10423fae0c84f6a3f13abf1042f28f2ae40ac3af/spec/Candid.md
 [candid-crate]: https://github.com/dfinity/candid/tree/10423fae0c84f6a3f13abf1042f28f2ae40ac3af/rust/candid
 [state-tree]: https://docs.internetcomputer.org/references/ic-interface-spec/index.md
+[spec-call]: https://docs.internetcomputer.org/references/ic-interface-spec/canister-interface.md#system-api-call
+[abstract-callbacks]: https://docs.internetcomputer.org/references/ic-interface-spec/abstract-behavior.md#the-concrete-callback
+[abstract-starvation]: https://docs.internetcomputer.org/references/ic-interface-spec/abstract-behavior.md#rule-starvation
+[abstract-stopping]: https://docs.internetcomputer.org/references/ic-interface-spec/abstract-behavior.md#ic-management-canister-stopping-a-canister
+[cdk-call]: https://github.com/dfinity/cdk-rs/blob/070233b9c2820032b37ccf60ad9643eeb22b63a7/ic-cdk/src/call.rs
+[export-table]: https://github.com/dfinity/ic/blob/0ec627118654351acff526328b01c8395d7de414/rs/embedders/src/wasm_utils/instrumentation.rs
+[lean-task-manager]: https://github.com/leanprover/lean4/blob/v4.34.1/src/runtime/object.cpp#L769-L1109
+[std-async]: https://github.com/leanprover/lean4/blob/v4.34.1/src/Std/Async/Basic.lean
+[pocketic-update-call]: https://github.com/dfinity/pocketic-py/blob/main/pocket_ic/pocket_ic.py

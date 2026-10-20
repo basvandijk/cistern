@@ -1,0 +1,3 @@
+setup done
+caught: failed after 1
+result: ok 0

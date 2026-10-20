@@ -4,14 +4,15 @@ import Hello
 import Ic0
 import Probes
 import Interface
+import Ic
 
 /-!
 A canister written in Lean, for the experiment in README.md.
 
 c/canister.c exports the functions marked `@[export]` below as the canister's methods: `greet`,
-`hello`, `probe` and `notes` as queries, `add`, `add_then_exit` and `add_then_throw` as updates,
-and `add` also as the query `add_query`. Their arguments and replies are Candid, of the types that
-Interface.lean gives them, from which canister.did is generated:
+`hello`, `probe`, `notes` and `call_in_query` as queries, the others as updates, and `add` also as
+the query `add_query`. Their arguments and replies are Candid, of the types that Interface.lean
+gives them, from which canister.did is generated:
 
 - `greet : (text) -> (text)`: replies `Hello, <argument>!`.
 - `hello : (vec text) -> (text)`: runs the `main` of ../lean-wasm/Hello.lean, with the argument
@@ -28,6 +29,16 @@ Interface.lean gives them, from which canister.did is generated:
 - `add_then_throw : (text) -> ()`: adds the argument, and then throws, which rejects the message.
   That does not trap, so the IC keeps what it changed.
 - `notes : (text) -> (vec text)`: replies with the notes. It ignores its argument.
+- The methods that call other canisters, through Ic.lean: `random : () -> (blob)`, 32 random
+  bytes from the management canister's `raw_rand`; `greet_via : (principal, text) -> (text)`,
+  the greeting of the given canister's `greet`; `add_twice : (text) -> (nat, nat)`, two calls to
+  this canister's `add`, one after the other, and `add_both : (text, text) -> (nat, nat)`, two at
+  the same time, with the counts that they reply; `call_raw : (principal, text, blob) ->
+  (variant { Ok : blob; Err : text })`, any call, with the reply as it is, or the error;
+  `call_then_exit : (text) -> ()`, which calls `add` and exits when the reply comes, so that the
+  callback traps; `call_then_throw : (text) -> ()`, which throws instead, so that the callback
+  rejects; and `oneway_add : (text) -> ()`, which calls `add` without waiting for the reply.
+- `call_in_query : (text) -> (text)`: a query that makes a call, which traps.
 
 The methods are `BaseIO` actions: `IO` actions that cannot throw an error. `serve` makes one of a
 handler that can, by rejecting the message with the error.
@@ -40,20 +51,31 @@ A decoding error's message starts with `Candid:`. Rejecting does not trap, so in
 keeps what `handler` changed before it threw: it keeps what an update that returns changed,
 whether it replied, rejected or neither, and discards what one that traps changed.
 
-`e.Args` and `e.Rets` are types, so the type of `handler` depends on `e`: for `Interface.greet`
-it is `String → IO String`. `have := e.args` puts `e`'s `CandidArgs` instances in scope, where
-`Candid.decode` and `Candid.encode` find them. Both return an `Except`, which `IO.ofExcept` turns
-into an `IO` action that throws the error. -/
-def serve (e : Interface.Endpoint) (handler : e.Args → IO e.Rets) : BaseIO Unit :=
+`e.Args` and `e.Rets` are types, so the type of `handler` depends on `e`, and so does its monad
+(`Ic.Handler`): for `Interface.greet`, a query, it is `String → IO String`; for an update it is
+an `Ic.Async` action, in which the handler can call other canisters, and into which `IO` actions
+lift. `have := e.args` puts `e`'s `CandidArgs` instances in scope, where `Candid.decode` and
+`Candid.encode` find them. Both return an `Except`, which `Ic.ofCandid` turns into an action
+that throws the error.
+
+The handler runs, as an `Ic.Async` action, up to its first await of a call's response, which
+ends the message; the rest of it, and the reply, run in the message of the callback that
+resolves the response, which `BaseIO.chainTask` arranges: it runs its continuation when the task
+finishes, at once if it has (`sync`: inside `resolve`, or here, for a handler that did not
+await). So a method that does not call replies in its own message, as before. -/
+def serve (e : Interface.Endpoint) (handler : e.Args → Ic.Handler e.kind e.Rets) : BaseIO Unit :=
   have := e.args
   have := e.rets
-  EIO.catchExceptions
-    (do
-      let args : e.Args ← IO.ofExcept (Candid.decode (← Ic0.msgArgData))
-      let reply ← handler args
-      Ic0.msgReplyDataAppend (← IO.ofExcept (Candid.encode reply))
-      Ic0.msgReply)
-    fun err => Ic0.msgReject (toString err)
+  let run : Ic.Async Unit := do
+    let args : e.Args ← Ic.ofCandid (Candid.decode (← Ic0.msgArgData))
+    let reply ← Ic.Handler.run e.kind (handler args)
+    Ic0.msgReplyDataAppend (← Ic.ofCandid (Candid.encode reply))
+    Ic0.msgReply
+  do
+    let task ← Std.Async.EAsync.toBaseIO run
+    BaseIO.chainTask (sync := true) task fun
+      | .ok () => pure ()
+      | .error err => Ic0.msgReject (toString err)
 
 @[export cistern_greet]
 def greet : BaseIO Unit := serve Interface.greet fun name => do
@@ -119,12 +141,94 @@ def addThenExit : BaseIO Unit := serve Interface.addThenExit fun note => do
   IO.Process.exit count.toUInt8
 
 /-- Adds the argument, and then throws, so that `serve` rejects the message. That does not trap,
-so the IC keeps what the message changed. `discard` drops the number of notes. -/
+so the IC keeps what the message changed. `discard` drops the number of notes. The error is an
+`IO.Error`, as an `Ic.Error`, whose message `serve` rejects with. -/
 @[export cistern_add_then_throw]
 def addThenThrow : BaseIO Unit := serve Interface.addThenThrow fun note => do
   discard <| addNote note
-  throw (IO.userError s!"added {note}, then threw")
+  throw (.io (IO.userError s!"added {note}, then threw"))
 
 /-- Replies with the notes. `fun _ =>` ignores the argument. -/
 @[export cistern_notes]
 def notes : BaseIO Unit := serve Interface.notes fun _ => notesRef.get
+
+/-! The methods that call other canisters. Their handlers are `Ic.Async` actions (see Ic.lean):
+`Ic.call` makes a call, and what follows it runs in a later message, when the response comes. -/
+
+/-- This canister's principal. -/
+def self : BaseIO Candid.Principal := do
+  return ⟨← Ic0.canisterSelf⟩
+
+/-- Replies with 32 random bytes from the management canister's `raw_rand`: the reply comes in a
+later message, in which the handler finishes and `serve` replies. -/
+@[export cistern_random]
+def random : BaseIO Unit := serve Interface.random fun () => Ic.rawRand
+
+/-- Replies with the greeting of the given canister's `greet` for the name. The `IO.println`
+reaches the log in the first message, `return` in the callback's. -/
+@[export cistern_greet_via]
+def greetVia : BaseIO Unit := serve Interface.greetVia fun (canister, name) => do
+  IO.println s!"asking {canister.toText} to greet {name}"
+  let greeting : String ← Ic.call canister "greet" name
+  return greeting
+
+/-- Two calls to this canister's `add`, one after the other: three messages, with the second
+call made in the callback of the first. -/
+@[export cistern_add_twice]
+def addTwice : BaseIO Unit := serve Interface.addTwice fun note => do
+  let self ← self
+  let first : Nat ← Ic.call self "add" s!"{note}/1"
+  let second : Nat ← Ic.call self "add" s!"{note}/2"
+  return (first, second)
+
+/-- Two calls to this canister's `add` at the same time: both are made in the first message, and
+their replies come in two later messages, in either order. -/
+@[export cistern_add_both]
+def addBoth : BaseIO Unit := serve Interface.addBoth fun (a, b) => do
+  let self ← self
+  Std.Async.EAsync.concurrently (Ic.call (β := Nat) self "add" a) (Ic.call (β := Nat) self "add" b)
+
+/-- Calls the method of the canister with the argument, which must be a Candid message, and
+replies with the reply, as it is, or with the error's message: a reject's reads
+`call rejected: <code> - <message>`. -/
+@[export cistern_call_raw]
+def callRaw : BaseIO Unit := serve Interface.callRaw fun (canister, method, arg) => do
+  try
+    let response ← Ic.Call.perform { callee := canister, method, arg }
+    return (.ok response.data : Except String ByteArray)
+  catch err =>
+    return .error (toString err)
+
+/-- Calls this canister's `add` with the argument, and when the reply comes adds a second note
+and exits, which traps: the IC discards the callback's changes, the second note, and runs the
+cleanup callback; the first note stays, as `add`'s message was kept. The handler's message is
+then rejected by the IC, as nothing can reply to it. -/
+@[export cistern_call_then_exit]
+def callThenExit : BaseIO Unit := serve Interface.callThenExit fun note => do
+  let self ← self
+  let count : Nat ← Ic.call self "add" note
+  discard <| addNote s!"{note}/callback"
+  IO.Process.exit count.toUInt8
+
+/-- Calls this canister's `add` with the argument, and when the reply comes throws, so that
+`serve` rejects the handler's message from the callback. The note stays. -/
+@[export cistern_call_then_throw]
+def callThenThrow : BaseIO Unit := serve Interface.callThenThrow fun note => do
+  let self ← self
+  let count : Nat ← Ic.call self "add" note
+  throw (.io (IO.userError s!"added {note} as note {count}, then threw"))
+
+/-- Calls this canister's `add` with the argument, one-way: the reply is dropped, and this
+message replies at once. The note is there when the call has been handled, after this message. -/
+@[export cistern_oneway_add]
+def onewayAdd : BaseIO Unit := serve Interface.onewayAdd fun note => do
+  let self ← self
+  Ic.oneway self "add" note
+
+/-- A query that makes a one-way call, through `Ic0.callOneway` directly, as `Ic.call` does not
+typecheck in a query's handler: the System API traps, as a query cannot call. -/
+@[export cistern_call_in_query]
+def callInQuery : BaseIO Unit := serve Interface.callInQuery fun note => do
+  let self ← self
+  let code ← Ic0.callOneway self.bytes "add" (← IO.ofExcept (Candid.encode note)) 0 0 none
+  return s!"call_perform returned {code}"

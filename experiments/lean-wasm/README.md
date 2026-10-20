@@ -22,7 +22,8 @@ for bit.
 
 ```sh
 nix build .#lean-wasm-report && cat result/report.txt   # the inspection, see below
-nix flake check                                         # hello.wasm must print what native Lean prints
+nix flake check                                         # hello.wasm must print what native Lean prints,
+                                                        # and tasks.wasm the traces of tasks/
 ```
 
 By hand, in the dev shell (it provides `lean`, `wasmtime` and `wasm-objdump`):
@@ -44,14 +45,23 @@ Each step is a flake package:
 | Attribute           | Output                                                                  | Built by                           |
 | ------------------- | ----------------------------------------------------------------------- | ---------------------------------- |
 | `lean-wasm-init-c`  | C for the 649 modules of Lean's `Init` library (32,209,233 bytes)       | [nix/lean-c.nix](nix/lean-c.nix)   |
+| `lean-wasm-std-c`   | `Std/Async/Basic.c`: the module `Std.Async.Basic` of Lean's `Std` library | [nix/lean-c.nix](nix/lean-c.nix) |
 | `lean-wasm-hello-c` | `Hello.c`                                                               | [nix/lean-c.nix](nix/lean-c.nix)   |
+| `lean-wasm-tasks-c` | `Tasks.c`                                                               | [nix/lean-c.nix](nix/lean-c.nix)   |
 | `lean-wasm-runtime` | Lean's C++ runtime for wasm32: `lib/libleanrt.a`, `include/lean/*.h`    | [nix/runtime.nix](nix/runtime.nix) |
 | `lean-wasm-init`    | `lib/libInit.a`: the Init C, compiled for wasm32                        | [nix/wasm.nix](nix/wasm.nix)       |
+| `lean-wasm-std`     | `lib/libStd.a`: the Std.Async.Basic C, compiled for wasm32              | [nix/wasm.nix](nix/wasm.nix)       |
 | `lean-wasm-hello`   | `bin/hello.wasm`; `bin/hello-opt.wasm`, after `wasm-opt -O`; `share/hello.map`, the link map | [nix/wasm.nix](nix/wasm.nix) |
+| `lean-wasm-tasks`   | `bin/tasks.wasm`: [Tasks.lean](Tasks.lean), which tries the task manager (see below) | [nix/wasm.nix](nix/wasm.nix) |
 | `lean-wasm-report`  | `report.txt`; the raw `wasm-objdump` output in `sections.txt`, `imports.txt`, `exports.txt` | [report.py](report.py) |
 
 The check `lean-wasm-hello-runs` runs `hello.wasm` and `hello-opt.wasm` under wasmtime and
-`lean --run Hello.lean` natively, and fails unless all three print the same.
+`lean --run Hello.lean` natively, and fails unless all three print the same. The check
+`lean-wasm-tasks-runs` runs each case of `tasks.wasm` under wasmtime, with the IC's Wasm stack,
+and compares its trace with the one committed in [tasks/](tasks); the cases that do not depend on
+the single-threaded order also run natively, with `lean --threads=1 --run Tasks.lean`, where
+Lean's own task manager, with one worker thread, must give the same trace (see [Tasks and
+promises](#tasks-and-promises)).
 
 ## Pipeline
 
@@ -186,10 +196,10 @@ The report checks the limits that the IC checks when a module is installed (in
 
 | hello.wasm                       | Value                                 | IC limit                                             |
 | -------------------------------- | ------------------------------------- | ---------------------------------------------------- |
-| module size                      | 935,707 bytes                         | 100 MiB [1]                                          |
-| gzipped (the IC accepts gzip)    | 147,863 bytes                         | 2 MiB per `install_code` message; larger modules are uploaded in chunks [1, 3] |
-| Code section                     | 765,985 bytes                         | 12 MiB [1, 4]                                        |
-| defined functions                | 2,286                                 | 50,000 [1]                                           |
+| module size                      | 934,973 bytes                         | 100 MiB [1]                                          |
+| gzipped (the IC accepts gzip)    | 148,096 bytes                         | 2 MiB per `install_code` message; larger modules are uploaded in chunks [1, 3] |
+| Code section                     | 767,578 bytes                         | 12 MiB [1, 4]                                        |
+| defined functions                | 2,270                                 | 50,000 [1]                                           |
 | most instructions in a function  | 5,399 (`lean_apply_1`)                | 1,000,000 [1, 4]                                     |
 | highest complexity of a function | 55,513 (`lean_apply_1`)               | 1,000,000, with validation.rs's weights [4]          |
 | most locals in a function        | 38                                    | 10,000 [4]                                           |
@@ -210,7 +220,7 @@ From the link map (`share/hello.map`), as summarised in the report:
 | -------------------- | ---------: | --------: | -----------: |
 | Lean's Init library  |    394,092 |     1,323 |          649 |
 | libc++ and libc++abi |    161,183 |       535 |           21 |
-| Lean runtime         |    146,418 |       250 |           16 |
+| Lean runtime         |    148,011 |       234 |           15 |
 | wasi-libc            |     55,349 |       154 |          111 |
 | Hello.lean           |      8,814 |        22 |            1 |
 
@@ -218,8 +228,10 @@ Init accounts for 51% of the code. Code from every one of its 649 modules ends u
 module, because `runtime_initialize_Init` runs the runtime initializer of each one. These 649
 functions take 324,324 bytes, 82% of Init's code. Most of the libc++ code is locale support
 (`locale.cpp`), which the runtime's use of iostreams pulls in. The name section takes another
-146,479 bytes. `wasm-opt -O` makes the module 631,163 bytes (110,059 gzipped), partly by
-dropping that section. The optimized module has the same imports and exports.
+144,426 bytes. `wasm-opt -O` makes the module 632,405 bytes (110,613 gzipped), partly by
+dropping that section. The optimized module has the same imports and exports. (The runtime's
+share includes the task manager, which the generated `main` now creates; see
+[Tasks and promises](#tasks-and-promises).)
 
 Most of the code that `initialize_Init` brings in is only for the compiler. Before Hello.lean
 was a module file, `main` called `initialize_Hello`, and with it `initialize_Init`, which also
@@ -256,12 +268,14 @@ and `version.h`) are a derivation of their own, `lean-wasm-runtime.headers`, so 
 the rest of the runtime does not recompile Init. The configuration is minimal:
 
 - **Single-threaded**: no `LEAN_MULTI_THREAD`, as the IC has no threads ([wasmtime without
-  threads][ic-cargo], [wasmtime's defaults][wasmtime-config]). So there is no task manager.
-  Tasks (`Task.spawn`, `IO.asTask`) run synchronously, when they are created. `IO.Promise.new`,
-  and with it `IO.CancelToken.new`, needs the task manager: it ends the program with exit code 1
-  and "INTERNAL PANIC: `IO.Promise.new` called before the task manager is running", a message
-  that goes on to blame an `initialize` block. `IO.sleep` returns at once, without an error, as
-  the single-threaded `sleep_for` does nothing (`thread.h`).
+  threads][ic-cargo], [wasmtime's defaults][wasmtime-config]). Upstream's runtime then has no
+  task manager: tasks (`Task.spawn`, `IO.asTask`) run synchronously, when they are created, and
+  `IO.Promise.new`, and with it `IO.CancelToken.new`, ends the program with exit code 1 and
+  "INTERNAL PANIC: `IO.Promise.new` called before the task manager is running", a message that
+  goes on to blame an `initialize` block. [runtime/task-manager.patch](runtime/task-manager.patch)
+  gives this runtime a task manager that runs tasks on the one thread there is, so that promises
+  work (see [Tasks and promises](#tasks-and-promises)). `IO.sleep` returns at once, without an
+  error, as the single-threaded `sleep_for` does nothing (`thread.h`).
 - **No GMP**: Lean's own bignum code (`mpz.cpp`, `mpn.cpp`) is used instead.
 - **No mimalloc, no mmap**: `config.h` is lean4's, minus `LEAN_MIMALLOC`, so Lean objects come
   from wasi-libc's `malloc`.
@@ -293,6 +307,10 @@ the rest of the runtime does not recompile Init. The configuration is minimal:
   fixes it by implementing `String.toList` in Lean
   ([lean4#15533](https://github.com/leanprover/lean4/pull/15533)), so with that version the
   patch is no longer needed, and no longer applies.
+- **[runtime/task-manager.patch](runtime/task-manager.patch)**: the task manager for a runtime
+  without threads, see [Tasks and promises](#tasks-and-promises). Its hunks, in `object.cpp`
+  and `io.cpp`, are all under `#ifndef LEAN_MULTI_THREAD`, so that a runtime with threads is as
+  it was.
 - **[runtime/wasi.patch](runtime/wasi.patch)** has 16 small hunks. Two of them matter beyond
   making the build work:
   - `IO.getRandomBytes` uses `getentropy` (WASI's `random_get`). WASI has no `/dev/urandom`,
@@ -315,9 +333,79 @@ the rest of the runtime does not recompile Init. The configuration is minimal:
   the bottom of memory, so that an overflow traps instead of overwriting data. The stack is 128
   of the 129 initial pages.
 
+### Tasks and promises
+
+A canister that calls another canister gets the reply in a later message, through a callback
+(see [lean-canister](../lean-canister/README.md#calls)). The Lean idiom for a value that arrives
+later is a `Task`, and for one that something else provides an `IO.Promise`: the callback
+resolves the promise, and the rest of the handler, which `Std.Async`'s monads chain onto the
+promise's task with `BaseIO.bindTask`, runs. Upstream's runtime without threads has no task
+manager, which is what makes a task that has not finished wait, and runs it when it can:
+`Task.bind` and `Task.map` on such a task would read the null manager, and `IO.Promise.new`
+panics (see above). Its task manager ([object.cpp][lean-task-manager]) is a class whose workers
+are threads, which the build compiles even without `LEAN_MULTI_THREAD`, as `thread.h` stubs the
+locks and the condition variables, and makes a thread run its function at once, in the
+constructor. So the class could not be used as it is: a worker's loop would spin forever on a
+condition variable that does not wait, and `Task.get` on a task that has not finished would
+return a null value.
+
+[runtime/task-manager.patch](runtime/task-manager.patch) makes the class work without threads,
+in `#ifndef LEAN_MULTI_THREAD` branches:
+
+- `lean_init_task_manager_using` creates the manager, with no workers. Lean's generated `main`
+  calls it after the module initializers, and so does lean-canister's `canister_init`.
+- A task that is enqueued goes into the manager's queues as before, but nothing is spawned or
+  notified. Instead, `drain` runs the queued tasks on the calling thread, in the queues' order
+  (the highest priority first, first in first out within one), at the end of `enqueue`,
+  `resolve` and `add_dep`, the entries that can queue a task, until the queue is empty: a nested
+  entry, from a task that is running, only enqueues, and the outermost loop runs what it added.
+  So `IO.asTask` and `Task.spawn` run their action at once at the top level, as before, and after
+  the current task when called from a task; resolving a promise runs every task that waits on it,
+  and those that wait on them, before `resolve` returns, and `p.resolve v` from inside a task
+  returns before `v`'s continuations run, which is the order of a runtime with one worker thread.
+  A chain of tasks runs on a stack that does not grow with its length. A `(sync := true)` task
+  still runs inside the `resolve` that makes it ready, as upstream.
+- `Task.get` and `IO.waitAny` on a task that has not finished run what is queued, as the workers
+  would; if that does not finish the task, nothing ever will, and they end the program with an
+  internal panic (exit code 1), where upstream's code would deadlock. So do `IO.wait`,
+  `Std.Async.EAsync.block` and `Task.get` in Lean code, which call them.
+- `Promise.result!` on a promise that was dropped without being resolved ends the program with
+  an internal panic. Upstream prints a panic and then sleeps forever, and `sleep_for` does
+  nothing here, so it would spin; in a canister, that would burn the message's instruction limit.
+  `Promise.result?`, which resolves to `none` then, is unchanged, and the one to use.
+- Priorities above the maximum (`Task.Priority.dedicated`), which would get a thread of their
+  own, are the maximum.
+- `lean_io_promise_discard`, a function of this runtime only, resolves a promise with `none`
+  and frees the tasks that wait on it, and those that wait on them, without running them: their
+  closures, which hold the continuations and what they captured, and the reference that keeps a
+  task alive for its effects. A task that something else still refers to stays, as one that
+  never finishes. A promise that the freeing drops is discarded the same way. lean-canister's
+  cleanup callback uses it, where a continuation cannot run (see [its
+  Calls](../lean-canister/README.md#calls)).
+
+The manager is memory like any other, so in a canister it stays from one message to the next,
+with its queues empty, as every entry drains them before it returns; an upgrade, which starts
+with new memory, creates it anew. A promise in an `initialize` declaration cannot work, with or
+without the patch: the initializer marks the constant persistent, which waits for the tasks in it.
+
+[Tasks.lean](Tasks.lean) tries the patch: 19 cases, each a trace that the check
+`lean-wasm-tasks-runs` compares with the one in [tasks/](tasks). The `shared` cases, which run
+natively as well, with one worker thread, show that the order is that of a runtime with threads:
+a continuation on a promise runs when the promise is resolved, nested continuations in either
+order of resolution, a `do` block in `Std.Async`'s `Async` monad with three awaits runs segment
+by segment, `for` and `repeat` loops, `try … catch` and `Async.race` work, a dropped promise
+resolves to `none`, a continuation that resolves another promise returns before that promise's
+continuation runs, `IO.cancel` reaches the continuation, and chains of 10,000 and 100,000
+promises run. The `wasm` cases show the single-threaded order: a continuation runs inside the
+`resolve` that makes it ready, `Async.concurrently` runs both branches up to their awaits at
+once, priorities, `IO.asTask` at once at the top level but after the current task inside a
+task, and discarding a promise, which runs nothing and drops the promise that the continuation
+captured. The `trap` cases, `IO.wait` on a promise that nothing resolves and `Promise.result!` on
+one that was dropped, end with the internal panic.
+
 ## Open questions and next steps
 
-[lean-canister](../lean-canister) has since taken steps 1, 2, 3 and 5. Of step 9, it tried the
+[lean-canister](../lean-canister) has since taken steps 1, 2, 3, 4 and 5. Of step 9, it tried the
 Wasm memory between messages and across an upgrade, but not stable memory or `opt keep`.
 
 1. **Replace WASI with `ic0`.** The usual route for C and C++ is
@@ -348,9 +436,9 @@ Wasm memory between messages and across an upgrade, but not stable memory or `op
    `canister_post_upgrade`.
 4. **Asynchronous calls.** A canister calls other canisters asynchronously: the reply arrives in
    a later message, through a callback [2]. `IO.Promise` would be the obvious way to model that
-   in Lean, but this runtime has no task manager, so it panics (see [Porting the
-   runtime](#porting-the-runtime)). The CDK needs another mechanism, or a task manager that does
-   not need threads.
+   in Lean, but this runtime had no task manager, so it panicked. It now has one that does not
+   need threads (see [Tasks and promises](#tasks-and-promises)), and lean-canister calls other
+   canisters with promises and `Std.Async` (see [its Calls](../lean-canister/README.md#calls)).
 5. **Measure execution.** How many instructions does initialization take? An install may use
    300 billion and an update call 40 billion [1].
    [PocketIC](https://docs.internetcomputer.org/guides/testing/pocket-ic.md) runs an IC replica
@@ -397,5 +485,6 @@ code on `master` was the same. `report.txt` uses the same numbering.
 10. https://github.com/bytecodealliance/wasmtime/blob/v48.0.1/crates/wasmtime/src/config.rs
 
 [validation]: https://github.com/dfinity/ic/blob/master/rs/embedders/src/wasm_utils/validation.rs
+[lean-task-manager]: https://github.com/leanprover/lean4/blob/v4.34.1/src/runtime/object.cpp#L769-L1109
 [ic-cargo]: https://github.com/dfinity/ic/blob/master/Cargo.toml
 [wasmtime-config]: https://github.com/bytecodealliance/wasmtime/blob/v48.0.1/crates/wasmtime/src/config.rs

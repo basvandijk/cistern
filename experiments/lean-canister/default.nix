@@ -41,6 +41,7 @@ let
     inherit wasi canisterC;
     runtime = leanWasm.packages.lean-wasm-runtime;
     init = leanWasm.packages.lean-wasm-init;
+    std = leanWasm.packages.lean-wasm-std;
     candidWasm = candid.packages.candid-wasm;
   };
 

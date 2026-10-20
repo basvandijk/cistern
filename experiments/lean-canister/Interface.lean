@@ -82,9 +82,52 @@ ones: the replica caches the replies of queries by their arguments. -/
 abbrev notes : Endpoint :=
   { name := "notes", kind := .query, Args := String, Rets := Array String }
 
+/-! The methods that call other canisters (see Ic.lean). They are updates: a query cannot call. -/
+
+/-- 32 random bytes from the management canister's `raw_rand`. -/
+abbrev random : Endpoint :=
+  { name := "random", kind := .update, Args := Unit, Rets := ByteArray }
+
+/-- Calls `greet` of the given canister, this one or another, and replies with its greeting. -/
+abbrev greetVia : Endpoint :=
+  { name := "greet_via", kind := .update, Args := Candid.Principal × String, Rets := String }
+
+/-- Two calls to this canister's `add`, one after the other: the numbers of notes they reply. -/
+abbrev addTwice : Endpoint :=
+  { name := "add_twice", kind := .update, Args := String, Rets := Nat × Nat }
+
+/-- Two calls to this canister's `add` at the same time, with each of the arguments. -/
+abbrev addBoth : Endpoint :=
+  { name := "add_both", kind := .update, Args := String × String, Rets := Nat × Nat }
+
+/-- Calls the method of the canister with the argument, a Candid message, and replies with the
+reply, as it is, or with the error. -/
+abbrev callRaw : Endpoint :=
+  { name := "call_raw", kind := .update, Args := Candid.Principal × String × ByteArray,
+    Rets := Except String ByteArray }
+
+/-- Calls this canister's `add`, and when the reply comes, adds another note and exits, which
+traps: the IC discards what the callback changed, and runs the cleanup callback. -/
+abbrev callThenExit : Endpoint :=
+  { name := "call_then_exit", kind := .update, Args := String, Rets := Unit }
+
+/-- Calls this canister's `add`, and when the reply comes, throws, which rejects the message from
+the callback. -/
+abbrev callThenThrow : Endpoint :=
+  { name := "call_then_throw", kind := .update, Args := String, Rets := Unit }
+
+/-- Calls this canister's `add` one-way, without waiting for the reply, and replies at once. -/
+abbrev onewayAdd : Endpoint :=
+  { name := "oneway_add", kind := .update, Args := String, Rets := Unit }
+
+/-- A query that makes a call, which the System API does not allow: it traps. -/
+abbrev callInQuery : Endpoint :=
+  { name := "call_in_query", kind := .query, Args := String, Rets := String }
+
 /-- All of the methods. -/
 def endpoints : Array Endpoint :=
-  #[greet, hello, probe, add, addQuery, addThenExit, addThenThrow, notes]
+  #[greet, hello, probe, add, addQuery, addThenExit, addThenThrow, notes, random, greetVia,
+    addTwice, addBoth, callRaw, callThenExit, callThenThrow, onewayAdd, callInQuery]
 
 /-- A method's Candid type, a `func` type that is `query` for a query. `have := e.args` puts the
 entry's instances in scope, where Lean finds them for `Candid.method`. -/
@@ -98,10 +141,10 @@ def toDid : String :=
   Candid.Interface.toDid { service := some (.serviceOf (endpoints.map (·.method))) }
 
 /-- The names of the functions that canister.wasm must export for the IC: `canister_init`,
-`canister_post_upgrade`, and `canister_query <name>` or `canister_update <name>` per method.
-c/canister.c defines them, by hand. -/
+`canister_pre_upgrade`, `canister_post_upgrade`, and `canister_query <name>` or
+`canister_update <name>` per method. c/canister.c defines them, by hand. -/
 def exports : Array String :=
-  #["canister_init", "canister_post_upgrade"] ++ endpoints.map fun e =>
+  #["canister_init", "canister_pre_upgrade", "canister_post_upgrade"] ++ endpoints.map fun e =>
     s!"canister_{if e.kind == .query then "query" else "update"} {e.name}"
 
 end Interface

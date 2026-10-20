@@ -1,0 +1,5 @@
+setup done
+dedicated priority
+max priority
+default priority
+done

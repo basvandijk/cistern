@@ -23,20 +23,30 @@ let
   # Compiles the generated C for wasm32-wasip1, links hello.wasm and inspects it.
   wasm = pkgs.callPackage ./nix/wasm.nix {
     inherit wasi runtime;
-    inherit (leanC) initC helloC;
+    inherit (leanC)
+      initC
+      stdC
+      helloC
+      tasksC
+      ;
   };
 in
 {
   packages = {
     lean-wasm-init-c = leanC.initC;
+    lean-wasm-std-c = leanC.stdC;
     lean-wasm-hello-c = leanC.helloC;
+    lean-wasm-tasks-c = leanC.tasksC;
     lean-wasm-runtime = runtime;
     lean-wasm-init = wasm.init;
+    lean-wasm-std = wasm.std;
     lean-wasm-hello = wasm.hello;
+    lean-wasm-tasks = wasm.tasks;
     lean-wasm-report = wasm.report;
   };
 
   checks = {
     lean-wasm-hello-runs = wasm.check;
+    lean-wasm-tasks-runs = wasm.tasksCheck;
   };
 }

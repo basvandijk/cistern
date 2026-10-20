@@ -1,0 +1,8 @@
+spawned
+after spawn
+state finished
+outer start
+inner state inside outer: waiting
+outer end
+inner
+done

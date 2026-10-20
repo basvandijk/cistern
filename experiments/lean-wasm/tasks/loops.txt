@@ -1,0 +1,7 @@
+setup done
+for: 1
+for: 2
+for: 3
+repeat: 0
+repeat: 1
+result: ok 6

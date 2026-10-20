@@ -1,0 +1,3 @@
+setup done
+continuation none
+result: ok 0

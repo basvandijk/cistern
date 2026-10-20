@@ -1,10 +1,19 @@
 service : {
   add : (text) -> (nat);
+  add_both : (text, text) -> (nat, nat);
   add_query : (text) -> (nat) query;
   add_then_exit : (text) -> ();
   add_then_throw : (text) -> ();
+  add_twice : (text) -> (nat, nat);
+  call_in_query : (text) -> (text) query;
+  call_raw : (principal, text, blob) -> (variant { Ok : blob; Err : text });
+  call_then_exit : (text) -> ();
+  call_then_throw : (text) -> ();
   greet : (text) -> (text) query;
+  greet_via : (principal, text) -> (text);
   hello : (vec text) -> (text) query;
   notes : (text) -> (vec text) query;
+  oneway_add : (text) -> ();
   probe : (text, nat, opt nat) -> (record { result : nat; instructions : vec nat64 }) query;
+  random : () -> (blob);
 }
