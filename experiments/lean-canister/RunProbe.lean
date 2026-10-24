@@ -1,12 +1,11 @@
 import Probes
 
 /-!
-The probes of Probes.lean as a program: `run-probe <probe> <n>...` prints the result of the probe
-on its input of each size `n`, one per line.
+The probes of Probes.lean as a program: `lean --run RunProbe.lean <probe> <n>...` prints the
+result of the probe on its input of each size `n`, one per line.
 
-measure.py runs it under wasmtime, compiled to wasm32-wasip1 like lean-wasm's Hello.lean, to
-compare its recursion depths with the canister's. It also runs it natively, with `lean --run`,
-for the results of `repr`, which it cannot compute itself.
+measure.py runs it so, natively (nix/measure.nix's `--native`), for the results of `repr`, which
+it cannot compute itself; the canister's `probe` query runs the same probes in PocketIC.
 -/
 
 def main : List String → IO UInt32
@@ -19,5 +18,5 @@ def main : List String → IO UInt32
       IO.println (p.run (p.prepare n))
     return 0
   | _ => do
-    IO.eprintln "usage: run-probe <probe> <n>..."
+    IO.eprintln "usage: lean --run RunProbe.lean <probe> <n>..."
     return 2

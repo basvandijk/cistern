@@ -23,9 +23,11 @@ def greetVia : BaseIO Unit := serve Interface.greetVia fun (canister, name) => d
 `EAsync` runs a computation up to its first `await` of a task that has not finished, and the rest
 of it when that task finishes: the call's promise, which the callback resolves, is such a task.
 Canister.lean's `serve` starts the handler, and replies when it is done, from the message that
-finishes it. Its `bind` is `BaseIO.bindTask`, which is why the single-threaded runtime needs a task
-manager (lean-wasm's runtime/task-manager.patch). `do`, `←`, `throw`, `try … catch`, `for` and
-`Std.Async.EAsync.concurrently` work as in `IO`. What to know:
+finishes it. Its `bind` is `BaseIO.bindTask`, whose continuation the runtime's task manager
+runs: it is cooperative (one thread, no workers), so resolving the promise only queues the
+continuation, which runs when the host calls `lean_run_pending_tasks`, as every entry point and
+callback does before it returns (c/canister.c, c/ic0.c). `do`, `←`, `throw`, `try … catch`,
+`for` and `Std.Async.EAsync.concurrently` work as in `IO`. What to know:
 
 - Nothing after an `await` runs in the message that made the call. Other messages run in between,
   and may change the canister's state. What a message changes stays when it returns, also when a
@@ -36,8 +38,9 @@ manager (lean-wasm's runtime/task-manager.patch). `do`, `←`, `throw`, `try …
   `serve` turns into a reject of the handler's message, with `toString`. A trap in a handler's
   callback discards the callback's changes, and the IC rejects the handler's message with
   `CANISTER_ERROR`.
-- `IO.wait`, `Task.get` and `EAsync.block` on a task that has not finished trap: there is nothing
-  to wait for.
+- `IO.wait`, `Task.get` and `EAsync.block` on a task that has not finished run the queued tasks;
+  if none of them can finish it, as none can resolve a call's response, the runtime panics, which
+  the canister turns into a trap (c/wasi.c's `proc_exit`).
 - A query cannot call: its handler is an `IO` action (`Ic.Handler`), in which `Ic.call` does not
   typecheck. The System API traps on a call in a query.
 - The response is awaited in the call context of the handler. A task made in one message and

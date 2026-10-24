@@ -1,5 +1,0 @@
-setup done
-p continuation (some 3)
-after resolve q
-q continuation (some 7)
-done

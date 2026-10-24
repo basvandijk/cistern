@@ -1,4 +1,0 @@
-setup done
-p continuation (some 1)
-q continuation (some 2)
-result: ok 3

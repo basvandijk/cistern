@@ -5,7 +5,7 @@
 # there before is not built again.
 #
 # Not the aarch64-darwin checks: nixbuild.net builds only for x86_64-linux and aarch64-linux.
-# Nor the packages, though no check builds lean-wasm-report, nor on aarch64-linux the canister.
+# Nor the packages, but every package is a dependency of some check.
 # The secret NIXBUILD_TOKEN is a nixbuild.net auth token with the permissions build:read,
 # build:write, store:read and store:write.
 name: CI

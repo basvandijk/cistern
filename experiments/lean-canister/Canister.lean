@@ -15,8 +15,8 @@ the query `add_query`. Their arguments and replies are Candid, of the types that
 gives them, from which canister.did is generated:
 
 - `greet : (text) -> (text)`: replies `Hello, <argument>!`.
-- `hello : (vec text) -> (text)`: runs the `main` of ../lean-wasm/Hello.lean, with the argument
-  as its command-line arguments, and replies with what it prints.
+- `hello : (vec text) -> (text)`: runs the `main` of Hello.lean, with the argument as its
+  command-line arguments, and replies with what it prints.
 - `probe : (text, nat, opt nat) -> (record { result : nat; instructions : vec nat64 })`: prepares
   the input of size `n` for the probe of that name (see Probes.lean), runs the probe on it `runs`
   times (once if `runs` is `null`), and replies with the probe's result and the instructions that
@@ -60,9 +60,12 @@ that throws the error.
 
 The handler runs, as an `Ic.Async` action, up to its first await of a call's response, which
 ends the message; the rest of it, and the reply, run in the message of the callback that
-resolves the response, which `BaseIO.chainTask` arranges: it runs its continuation when the task
-finishes, at once if it has (`sync`: inside `resolve`, or here, for a handler that did not
-await). So a method that does not call replies in its own message, as before. -/
+resolves the response. The runtime's task manager is cooperative (c/canister.c): resolving only
+queues the rest, and the callback runs the queue before it returns (c/ic0.c), as c/canister.c's
+`serve` does after this returns, which runs what the handler spawned, such as `addBoth`'s two
+calls. `BaseIO.chainTask` with `sync := true` runs the reply inline in whatever finishes the
+handler's task: `toBaseIO` itself, for a handler that never awaits, so a method that does not
+call replies in its own message, as before; the queued rest of the handler otherwise. -/
 def serve (e : Interface.Endpoint) (handler : e.Args → Ic.Handler e.kind e.Rets) : BaseIO Unit :=
   have := e.args
   have := e.rets
@@ -181,8 +184,9 @@ def addTwice : BaseIO Unit := serve Interface.addTwice fun note => do
   let second : Nat ← Ic.call self "add" s!"{note}/2"
   return (first, second)
 
-/-- Two calls to this canister's `add` at the same time: both are made in the first message, and
-their replies come in two later messages, in either order. -/
+/-- Two calls to this canister's `add` at the same time: both are made in the first message, by
+the two tasks that `concurrently` spawns, which run when c/canister.c's `serve` runs the queued
+tasks; their replies come in two later messages, in either order. -/
 @[export cistern_add_both]
 def addBoth : BaseIO Unit := serve Interface.addBoth fun (a, b) => do
   let self ← self

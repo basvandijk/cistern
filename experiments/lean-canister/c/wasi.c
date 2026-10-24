@@ -174,7 +174,7 @@ _Noreturn void wasi_ic0_trap(char const * what) {
 }
 
 /* abort() traps with a message, where wasi-libc's executes `unreachable`. Among others, the
-   runtime's __cxa_throw (../../lean-wasm/runtime/wasi-stubs.cpp) calls it, after printing the
+   runtime's __cxa_throw (Lean's src/runtime/wasi/stubs.cpp) calls it, after printing the
    exception. Unlike exit(), it does not flush stdio, so it would lose the start of a line that
    stdout has buffered; wasi-libc without threads has no lock that the fflush could wait for.
    wasi-libc's abort.c.obj defines nothing else, so this keeps it out of the link. */

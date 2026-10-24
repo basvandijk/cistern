@@ -71,15 +71,19 @@ void canister_finish(char const * entry, unsigned long time_calls, char const * 
    Lean's generated `main` runs runtime_initialize_Canister, which calls
    lean_initialize_runtime_module and the runtime initializers of the imported modules,
    lean_io_mark_end_initialization, and then lean_init_task_manager. That `main` also calls
-   lean_setup_args, which does nothing here (../../lean-wasm/runtime/wasi-stubs.cpp).
+   lean_setup_args, which does nothing here (Lean's src/runtime/wasi/stubs.cpp).
 
    The task manager runs the tasks of Lean's `Task` and `IO.Promise`. This runtime has no threads,
-   so it runs them on this thread, when they are made or when what they wait for is resolved
-   (../../lean-wasm/runtime/task-manager.patch): that is how a callback resumes a handler that
-   awaits the response of a call (ic0.c). It is created after the initializers, as in a Lean
-   program: a constant that an initializer makes could not hold a promise anyway, as the
-   initializer waits for the tasks in it. Memory keeps it from one message to the next, and an
-   upgrade, which starts with new memory, creates it again.
+   so the manager is cooperative (see lean_run_pending_tasks in lean.h): spawning a task, or
+   resolving the promise that a continuation waits for, only queues it; the queue runs on this
+   thread when Lean waits for a task, and when the host calls lean_run_pending_tasks. Every
+   entry point and callback does that before it returns (serve below, ic0.c's on_response): so
+   a callback resumes the handler that awaits its response, and the queue is empty between
+   messages. The manager is created after the initializers, as in a Lean program: a constant
+   that an initializer makes could not hold a promise anyway, as without a manager a task runs
+   when it is made, and a wait on an unresolved promise is a panic. Memory keeps the manager
+   from one message to the next, and an upgrade, which starts with new memory, creates it
+   again.
 
    Canister.lean is a module file, and Lean generates three initializers for a module:
    runtime_initialize_Canister initializes what the program needs when it runs,
@@ -109,7 +113,8 @@ static void initialize(char const * entry) {
     lean_dec_ref(res);
     lean_io_mark_end_initialization();
     uint64_t initialized = ic0_performance_counter(0);
-    lean_init_task_manager_using(1); // one thread: this one
+    // Cooperative mode: tasks run on this thread, at a wait or in lean_run_pending_tasks.
+    lean_init_task_manager_using(0);
     uint64_t manager = ic0_performance_counter(0);
     char details[160];
     snprintf(details, sizeof details,
@@ -144,11 +149,16 @@ __attribute__((export_name("canister_pre_upgrade"))) void canister_pre_upgrade(v
     canister_finish("canister_pre_upgrade", time_calls, "");
 }
 
-/* A query or an update of Canister.lean: a `BaseIO Unit`, which returns lean_box(0). One that
-   calls another canister returns after making the call; its callback replies (ic0.c). */
+/* A query or an update of Canister.lean: a `BaseIO Unit`, which returns lean_box(0). Its
+   handler runs inside `method` up to its first await of a task that has not finished, and so
+   does the reply of one that never awaits (Canister.lean's `serve`). Then the queued tasks run:
+   what the handler spawned, such as add_both's two tasks, each of which makes a call, and, if
+   that finishes the handler, its reply. A method that awaited a call returns after making it;
+   its callback replies (ic0.c). */
 static void serve(char const * entry, lean_object * (*method)(void)) {
     unsigned long time_calls = wasi_ic0_time_calls;
     method();
+    lean_run_pending_tasks(); // what the handler spawned, and its reply if that finishes it
     canister_finish(entry, time_calls, "");
 }
 
