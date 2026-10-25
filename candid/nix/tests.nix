@@ -71,6 +71,6 @@ runCommand "candid-tests" { nativeBuildInputs = [ lean4 ]; } ''
   mkdir $out
   for test in ${lib.escapeShellArgs all}; do
     if [ $test = Parse ]; then args="--assets ${assets}"; else args=""; fi
-    run $out/$test.txt lean --run ${src}/Candid/Tests/$test.lean $args
+    run $out/$test.txt lean -j "$NIX_BUILD_CORES" --run ${src}/Candid/Tests/$test.lean $args
   done
 ''

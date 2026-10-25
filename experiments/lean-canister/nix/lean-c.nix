@@ -17,6 +17,7 @@
   lean4,
   candidC,
 }:
+# `-j`: as many threads as the build has cores (see ../../../nix/lean-libs.nix).
 runCommand "lean-canister-c" { nativeBuildInputs = [ lean4 ]; } ''
   # Only these files, so that other edits in the repository don't cause a rebuild.
   cp ${../Hello.lean} Hello.lean
@@ -27,7 +28,7 @@ runCommand "lean-canister-c" { nativeBuildInputs = [ lean4 ]; } ''
   cp ${../Canister.lean} Canister.lean
   mkdir -p $out/olean
   for module in Hello Ic0 Probes Interface Ic Canister; do
-    LEAN_PATH=$out/olean:${candidC}/olean lean -R . -o $out/olean/$module.olean \
+    LEAN_PATH=$out/olean:${candidC}/olean lean -j "$NIX_BUILD_CORES" -R . -o $out/olean/$module.olean \
       -c $out/$module.c $module.lean
   done
 ''

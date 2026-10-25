@@ -49,12 +49,13 @@ let
     fileset = lib.fileset.difference leanFiles programs;
   };
 in
+# `-j`: as many threads as the build has cores (see ../../nix/lean-libs.nix).
 runCommand "candid-c" { nativeBuildInputs = [ lean4 ]; } ''
   cd ${src}
   mkdir -p $out/c/Candid $out/olean/Candid
   for module in ${lib.escapeShellArgs modules}; do
     file=''${module//.//}
-    LEAN_PATH=$out/olean lean -R . -o $out/olean/$file.olean -c $out/c/$file.c $file.lean
+    LEAN_PATH=$out/olean lean -j "$NIX_BUILD_CORES" -R . -o $out/olean/$file.olean -c $out/c/$file.c $file.lean
   done
-  LEAN_PATH=$out/olean lean -R . -o $out/olean/Candid/Derive.olean Candid/Derive.lean
+  LEAN_PATH=$out/olean lean -j "$NIX_BUILD_CORES" -R . -o $out/olean/Candid/Derive.olean Candid/Derive.lean
 ''

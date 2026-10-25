@@ -21,8 +21,8 @@ rec {
   did = runCommand "lean-canister-did" { nativeBuildInputs = [ lean4 ]; } ''
     export LEAN_PATH=${canisterC}/olean:${candidC}/olean
     mkdir $out
-    lean --run ${../GenDid.lean} > $out/canister.did
-    lean --run ${../GenDid.lean} --exports > $out/exports.txt
+    lean -j "$NIX_BUILD_CORES" --run ${../GenDid.lean} > $out/canister.did
+    lean -j "$NIX_BUILD_CORES" --run ${../GenDid.lean} --exports > $out/exports.txt
   '';
 
   check = runCommand "lean-canister-interface" { nativeBuildInputs = [ wabt ]; } ''

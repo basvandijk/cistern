@@ -26,6 +26,11 @@ let
   # The options Lean's own build uses for its libraries: LEAN_EXTRA_OPTS and WFAIL in
   # src/CMakeLists.txt, leanOptions in src/lakefile.toml.in. They don't change the
   # generated C, but with warnings as errors a divergence from that build fails loudly.
+  #
+  # Every `lean` here gets `-j`: by default it starts as many worker threads as the host has
+  # cores, each with a 1 GB stack reservation, while a sandbox allows only NIX_BUILD_CORES cores and
+  # may limit threads or address space (on a many-core builder, compiling a file whose
+  # declarations elaborate in parallel then fails with "failed to create thread").
   coreFlags = [
     "-Dinterpreter.prefer_native=false"
     "-Dlinter.coreInternal=true"
@@ -43,7 +48,7 @@ rec {
     # keep the machine busy while bounding memory use.
     find Init.lean Init -name '*.lean' | sed 's/\.lean$//' | sort |
       xargs -P $(( NIX_BUILD_CORES > 1 ? NIX_BUILD_CORES / 2 : 1 )) -I{} \
-        lean -R . ${lib.escapeShellArgs coreFlags} -c $out/{}.c {}.lean
+        lean -j 2 -R . ${lib.escapeShellArgs coreFlags} -c $out/{}.c {}.lean
   '';
 
   # Std.Async.Basic, the asynchronous programming monads of Lean's `Std` library, which the canister
@@ -52,7 +57,7 @@ rec {
   stdC = runCommand "lean-std-c-${lean4.version}" { nativeBuildInputs = [ lean4 ]; } ''
     cd ${lean4}/src/lean
     mkdir -p $out/Std/Async
-    lean -R . ${lib.escapeShellArgs coreFlags} -c $out/Std/Async/Basic.c Std/Async/Basic.lean
+    lean -j "$NIX_BUILD_CORES" -R . ${lib.escapeShellArgs coreFlags} -c $out/Std/Async/Basic.c Std/Async/Basic.lean
   '';
 
   # Archive members are named after their file, and many modules share a file name

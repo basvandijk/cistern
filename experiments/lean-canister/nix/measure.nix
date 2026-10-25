@@ -43,8 +43,8 @@ runCommand "lean-canister-report"
   }
   ''
     # What Hello.lean prints natively, which the canister's hello query must reply.
-    lean --run ${../Hello.lean} > $PWD/hello.txt
-    lean --run ${../Hello.lean} a b > $PWD/hello-a-b.txt
+    lean -j "$NIX_BUILD_CORES" --run ${../Hello.lean} > $PWD/hello.txt
+    lean -j "$NIX_BUILD_CORES" --run ${../Hello.lean} a b > $PWD/hello-a-b.txt
     # For `lean --run RunProbe.lean`, which imports Probes.
     export LEAN_PATH=${canisterC}/olean
     mkdir $out
@@ -52,6 +52,7 @@ runCommand "lean-canister-report"
     hello_a_b=$PWD/hello-a-b.txt
     cd ${canister}/bin # so that the report names the modules by their file names
     python3 ${../measure.py} --did ${did}/canister.did --hello $hello --hello-a-b $hello_a_b \
-      --native "lean --run ${../RunProbe.lean}" --about "$about" --json $out/measurements.json \
+      --native "lean -j $NIX_BUILD_CORES --run ${../RunProbe.lean}" --about "$about" \
+      --json $out/measurements.json \
       canister.wasm canister-opt.wasm > $out/report.txt
   ''
