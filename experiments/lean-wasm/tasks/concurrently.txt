@@ -1,6 +1,0 @@
-x before await
-y before await
-setup done
-y after await 2
-x after await 1
-result: ok (1, 2)

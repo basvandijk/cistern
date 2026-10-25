@@ -1,14 +1,13 @@
-# Compiles the canister for wasm32 and links it, with WASI implemented on ic0. Also links the
-# probes as a WASI program, run-probe.wasm, for wasmtime.
+# Compiles the canister for wasm32 and links it, with WASI implemented on ic0.
 #
 # Interface (used by ../default.nix):
 #   A derivation with $out/bin/canister.wasm, $out/bin/canister-opt.wasm (the same after
-#   `wasm-opt -O`), $out/bin/run-probe.wasm and $out/share/canister.map (the linker's map of
-#   canister.wasm).
+#   `wasm-opt -O`) and $out/share/canister.map (the linker's map of canister.wasm).
 #
-# The Lean runtime, Init and Std.Async.Basic (`std`) are those of the lean-wasm experiment, which
-# are built for wasm32-wasip1, and the Candid library is `candidWasm`'s libCandid.a. Everything is
-# compiled with the runtime's flags; the files in ../c also with warnings as errors.
+# The Lean runtime (`runtime`, ../../../nix/lean-runtime.nix), Init and Std.Async.Basic (`init`,
+# `std`, ../../../nix/lean-libs.nix) are built for wasm32-wasip1, and the Candid library is
+# `candidWasm`'s libCandid.a. Everything is compiled with the runtime's flags; the files in ../c
+# also with warnings as errors.
 {
   lib,
   binaryen,
@@ -34,7 +33,7 @@ wasi.runCommandCC "lean-canister"
   ''
     # Two directories, as Ic0.c and Canister.c differ from ic0.c and canister.c only in case.
     mkdir lean c
-    for module in Hello Ic0 Probes Interface Ic Canister RunProbe; do
+    for module in Hello Ic0 Probes Interface Ic Canister; do
       $CC ${cflags} -c ${canisterC}/$module.c -o lean/$module.o
     done
     for file in ic0 wasi canister; do
@@ -75,12 +74,8 @@ wasi.runCommandCC "lean-canister"
       exit 1
     fi
 
-    # The probes as a WASI command, linked like lean-wasm's hello.wasm.
-    $CC lean/{Probes,RunProbe}.o ${init}/lib/libInit.a ${runtime}/lib/libleanrt.a ${ldflags} \
-      -o run-probe.wasm
-
     wasm-opt -O canister.wasm -o canister-opt.wasm
-    install -Dm444 -t $out/bin canister.wasm canister-opt.wasm run-probe.wasm
+    install -Dm444 -t $out/bin canister.wasm canister-opt.wasm
     mkdir -p $out/share
     sed -E 's|${builtins.storeDir}/[0-9a-z]{32}-||g' canister.map > $out/share/canister.map
   ''

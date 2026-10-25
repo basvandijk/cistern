@@ -2,11 +2,10 @@
 # has none (see lean-c.nix).
 #
 # Interface (used by ../default.nix):
-#   A derivation with $out/lib/libCandid.a, which a program or canister links with the libInit.a
-#   and libleanrt.a of the lean-wasm experiment.
+#   A derivation with $out/lib/libCandid.a, which a canister links with libInit.a
+#   (../../nix/lean-libs.nix) and libleanrt.a (../../nix/lean-runtime.nix).
 #
-# As for libInit.a (../../experiments/lean-wasm/nix/wasm.nix), each object is named after its
-# module, and compiled with the runtime's flags.
+# As for libInit.a, each object is named after its module, and compiled with the runtime's flags.
 {
   lib,
   wasi,

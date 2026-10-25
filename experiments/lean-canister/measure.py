@@ -1,8 +1,8 @@
 """Installs the Lean canister in PocketIC, checks its replies and its state, and measures its
 instructions.
 
-Usage: measure.py [--pocket-ic BIN] --did FILE --hello FILE --hello-a-b FILE [--wasmtime BIN]
-                  [--run-probe WASM] [--native COMMAND] [--about TEXT] [--json FILE] WASM...
+Usage: measure.py [--pocket-ic BIN] --did FILE --hello FILE --hello-a-b FILE [--native COMMAND]
+                  [--about TEXT] [--json FILE] WASM...
 
 Starts a PocketIC server, which BIN runs (default: pocket-ic), and uses it with pocketic-py, its
 Python library (https://github.com/dfinity/pocketic-py): creates an instance with one
@@ -32,10 +32,9 @@ other one, add_twice and add_both, which call add of the canister itself, call_r
 method that rejects, with one that does not exist and with a canister that does not exist,
 call_then_exit, whose callback traps, call_then_throw, whose callback throws, oneway_add, and
 call_in_query, a query that calls, which traps; and upgrades a third time, which runs
-canister_pre_upgrade. With --run-probe, also runs the recursion probes under wasmtime (default:
-wasmtime) in that program, RunProbe.lean, for their depths there. With --native, which is a
-command that runs RunProbe.lean natively, such as `lean --run RunProbe.lean` with LEAN_PATH set,
-checks the probe results that have no formula, those of repr, against it.
+canister_pre_upgrade. With --native, a command that runs RunProbe.lean natively, such as
+`lean --run RunProbe.lean` with LEAN_PATH set, checks the probe results that have no formula,
+those of repr, against it.
 
 Prints the report on standard output, and writes the measurements to the --json file. Fails if a
 module does not install or upgrade, or a reply, a probe's result, the notes or the charge for the
@@ -71,10 +70,10 @@ from ic.candid import Types
 from ic.parser.DIDEmitter import DIDEmitter, DIDLexer, DIDParser
 from pocket_ic import PocketIC, SubnetConfig
 
-# The 1-2-5 series of ../lean-wasm/README.md, for the recursion depth.
+# The recursion depths to try: a 1-2-5 series.
 DEPTHS = [1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000, 1_000_000,
           2_000_000, 5_000_000, 10_000_000]
-# The sizes of the String.map table there, doubled further.
+# The string lengths to try: doubling.
 LENGTHS = [10_000, 20_000, 40_000, 80_000, 160_000, 320_000, 640_000, 1_280_000]
 
 # Probes.lean's probes, the sizes to try them at, and their results. repr's has no formula: the
@@ -93,11 +92,6 @@ PROBES = {
 # Sizes at which each probe runs twice in one query, which shows what its first run costs more.
 TWICE = {"noop": 0, "deep": 1_000, "countM": 1_000, "repr": 1_000, "zip": 1_000, "deepK": 1_000,
          "deepKB": 1_000, "toUpper": 10_000, "toUpperNonAscii": 10_000}
-# The probes whose depth is limited by the stack, which run under wasmtime too.
-RECURSIVE = [name for name, (sizes, _) in PROBES.items() if sizes is DEPTHS]
-
-# The IC's Wasm stack (MAX_WASM_STACK_SIZE in rs/embedders/src/lib.rs).
-WASM_STACK = 5 * 1024 * 1024
 
 # What the IC charges for the first access of a message to a 64 KiB page of Wasm memory, and in an
 # update as much again for its first write to it: page_overhead (DEFAULT_PAGE_OVERHEAD in
@@ -760,47 +754,7 @@ def measure_canisters(server, wasms, methods, expected_hello):
     return results
 
 
-# wasmtime
-
-
-class Wasmtime:
-    """run-probe.wasm under wasmtime, with the IC's Wasm stack, compiled once with `options`."""
-
-    def __init__(self, binary, wasm, cwasm, options):
-        self.binary, self.cwasm = binary, cwasm
-        # Without wasmtime's cache, which would be in $HOME.
-        subprocess.run([binary, "compile", "-C", "cache=n", *options, wasm, "-o", cwasm], check=True)
-
-    def attempt(self, name, n):
-        p = subprocess.run(
-            [self.binary, "run", "-C", "cache=n", "--allow-precompiled", "-W",
-             f"max-wasm-stack={WASM_STACK}", self.cwasm, name, str(n)],
-            capture_output=True, text=True,
-        )
-        if p.returncode == 0:
-            result = int(p.stdout)
-            check_result("run-probe.wasm", name, n, result)
-            return {"n": n, "result": result}
-        # Anything but a stack overflow is an error, so that it does not pass for one.
-        check("wasm trap: call stack exhausted" in p.stderr, f"run-probe.wasm {name} {n}: {p.stderr}")
-        return {"n": n, "failure": "stack overflow"}
-
-
-def measure_wasmtime(binary, wasm, workdir):
-    """The recursion probes' depths under wasmtime, with Cranelift's default optimizations, and
-    with them off, as the IC compiles."""
-    version = subprocess.run([binary, "--version"], capture_output=True, text=True, check=True).stdout
-    out = {"version": version.strip(), "configurations": {}}
-    for label, options in [("wasmtime", []), ("wasmtime -O opt-level=0", ["-O", "opt-level=0"])]:
-        engine = Wasmtime(binary, wasm, Path(workdir, f"run-probe-{len(out['configurations'])}.cwasm"), options)
-        probes = out["configurations"][label] = {}
-        for name in RECURSIVE:
-            runs, largest_run = largest(DEPTHS, lambda n: engine.attempt(name, n))
-            probes[name] = {"runs": runs, "largest": largest_run}
-    return out
-
-
-def check_natively(command, results, wasmtime):
+def check_natively(command, results):
     """Checks the probe results that have no formula against those of `command`, which runs
     RunProbe.lean natively."""
     for name, (_, expected) in PROBES.items():
@@ -811,11 +765,6 @@ def check_natively(command, results, wasmtime):
             runs = r["probes"][name] + (r["largest"][name]["bisection"] if name in r["largest"] else [])
             found += [(r["module"], run["n"], run["result"]) for run in runs if "result" in run]
             found.append((r["module"], r["twice"][name]["n"], r["twice"][name]["result"]))
-        for label, probes in (wasmtime or {}).get("configurations", {}).items():
-            if name in probes:
-                p = probes[name]
-                runs = p["runs"] + (p["largest"]["bisection"] if p["largest"] else [])
-                found += [(label, run["n"], run["result"]) for run in runs if "result" in run]
         sizes = sorted({n for _, n, _ in found})
         # `lean --run` prints its errors on standard output.
         p = subprocess.run([*shlex.split(command), name, *map(str, sizes)], capture_output=True,
@@ -888,7 +837,7 @@ def failure(message):
     return message.splitlines()[0]
 
 
-def report(about, modules, results, wasmtime):
+def report(about, modules, results):
     names = [r["module"] for r in results]
     title = "Report on " + " and ".join(names)
     print(f"{title}\n{'=' * len(title)}\n")
@@ -1063,19 +1012,11 @@ def report(about, modules, results, wasmtime):
     table([""] + names, rows)
 
     heading("Limits")
-    text = ("The largest size at which each probe worked, and why it failed at the next size:"
-            " the 5 MiB Wasm stack, or the limit of 5,000,000,000 instructions for a query."
-            " Found by bisection, after the sizes of the table below. The other probes worked"
-            " at every size there.")
-    if wasmtime:
-        text += (f" The last columns are the depths of run-probe.wasm, the same probes in a"
-                 f" WASI program, under {wasmtime['version']} with the same stack"
-                 f" (-W max-wasm-stack={WASM_STACK}): with Cranelift's default optimizations,"
-                 f" and with -O opt-level=0, which is how the IC compiles. There the next depth"
-                 f" ran out of stack (\"call stack exhausted\").")
-    print(fill(text, "  "))
+    print(fill("The largest size at which each probe worked, and why it failed at the next size:"
+               " the 5 MiB Wasm stack, or the limit of 5,000,000,000 instructions for a query."
+               " Found by bisection, after the sizes of the table below. The other probes worked"
+               " at every size there.", "  "))
     print()
-    configurations = (wasmtime or {}).get("configurations", {})
     rows = []
     for name in PROBES:
         if not any(name in r["largest"] for r in results):
@@ -1084,11 +1025,8 @@ def report(about, modules, results, wasmtime):
         reasons = {failure(l["fails"]["failure"]) for l in largest_run if l}
         cells = [name] + [number(l["works"]["n"]) if l else "none failed" for l in largest_run]
         cells.append(" / ".join(sorted(reasons)))
-        for probes in configurations.values():
-            l = probes.get(name, {}).get("largest")
-            cells.append(number(l["works"]["n"]) if l else "")
         rows.append(cells)
-    table(["probe"] + names + ["then"] + list(configurations), rows, text=(0, len(names) + 1))
+    table(["probe"] + names + ["then"], rows, text=(0, len(names) + 1))
 
     heading("Instructions of the probes")
     print(fill("The instructions that each probe took in a query of its own, as"
@@ -1134,8 +1072,6 @@ def main():
     parser.add_argument("--did", required=True, type=Path)
     parser.add_argument("--hello", required=True, type=Path)
     parser.add_argument("--hello-a-b", required=True, type=Path)
-    parser.add_argument("--wasmtime", default="wasmtime")
-    parser.add_argument("--run-probe", type=Path)
     parser.add_argument("--native")
     parser.add_argument("--about", default="")
     parser.add_argument("--json", type=Path)
@@ -1153,7 +1089,6 @@ def main():
             raise
         finally:
             server.close()
-        wasmtime = args.run_probe and measure_wasmtime(args.wasmtime, args.run_probe, workdir)
 
     # The modules must agree, also where the expected result is not known.
     for name in PROBES:
@@ -1161,12 +1096,11 @@ def main():
         common = set.intersection(*(set(s) for s in sets))
         check(all(len({s[n] for s in sets}) == 1 for n in common), f"probe {name}: modules disagree")
     if args.native:
-        check_natively(args.native, results, wasmtime)
+        check_natively(args.native, results)
 
-    report(args.about, [w.read_bytes() for w in args.wasm], results, wasmtime)
+    report(args.about, [w.read_bytes() for w in args.wasm], results)
     if args.json:
-        measurements = {"modules": results, "wasmtime": wasmtime or None}
-        args.json.write_text(json.dumps(measurements, indent=2) + "\n")
+        args.json.write_text(json.dumps({"modules": results}, indent=2) + "\n")
 
 
 if __name__ == "__main__":

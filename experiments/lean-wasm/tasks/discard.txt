@@ -1,5 +1,0 @@
-setup done
-discarded
-outer task: running
-inner promise's task: none
-after resolve p

@@ -1,6 +1,0 @@
-segment 0
-setup done
-segment 1: 1
-segment 2: 2
-segment 3: 3
-result: ok 6

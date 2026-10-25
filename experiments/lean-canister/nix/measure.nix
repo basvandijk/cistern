@@ -1,5 +1,5 @@
 # Installs the canister in PocketIC, in the sandbox, and measures it with ../measure.py. Also
-# runs run-probe.wasm under wasmtime, and RunProbe.lean natively, for comparison.
+# runs RunProbe.lean natively, for comparison.
 #
 # Interface (used by ../default.nix):
 #   A derivation with $out/report.txt, and the measurements in $out/measurements.json. It fails
@@ -12,7 +12,6 @@
   lean4,
   pocket-ic,
   pocket-ic-py,
-  wasmtime,
   wasi,
   canister,
   canisterC,
@@ -27,7 +26,6 @@ runCommand "lean-canister-report"
       pocket-ic
       # python3 with pocketic-py, for measure.py.
       pocket-ic-py
-      wasmtime
     ];
     # measure.py talks to PocketIC on 127.0.0.1, which the macOS sandbox allows only with this.
     __darwinAllowLocalNetworking = true;
@@ -41,14 +39,12 @@ runCommand "lean-canister-report"
       + "canisters, through Ic.lean and Std.Async.Basic. Measured by measure.py "
       + "in PocketIC ${pocket-ic.version}, through pocketic-py ${pocket-ic-py.pocket-ic.version}, "
       + "on one application subnet with the IC's production limits, on "
-      + "${stdenv.hostPlatform.system}. run-probe.wasm is RunProbe.lean, which "
-      + "imports Probes.lean, compiled in the same way, but as a WASI program; measured under "
-      + "wasmtime ${wasmtime.version}.";
+      + "${stdenv.hostPlatform.system}.";
   }
   ''
     # What Hello.lean prints natively, which the canister's hello query must reply.
-    lean --run ${../../lean-wasm/Hello.lean} > $PWD/hello.txt
-    lean --run ${../../lean-wasm/Hello.lean} a b > $PWD/hello-a-b.txt
+    lean -j "$NIX_BUILD_CORES" --run ${../Hello.lean} > $PWD/hello.txt
+    lean -j "$NIX_BUILD_CORES" --run ${../Hello.lean} a b > $PWD/hello-a-b.txt
     # For `lean --run RunProbe.lean`, which imports Probes.
     export LEAN_PATH=${canisterC}/olean
     mkdir $out
@@ -56,7 +52,7 @@ runCommand "lean-canister-report"
     hello_a_b=$PWD/hello-a-b.txt
     cd ${canister}/bin # so that the report names the modules by their file names
     python3 ${../measure.py} --did ${did}/canister.did --hello $hello --hello-a-b $hello_a_b \
-      --run-probe run-probe.wasm \
-      --native "lean --run ${../RunProbe.lean}" --about "$about" --json $out/measurements.json \
+      --native "lean -j $NIX_BUILD_CORES --run ${../RunProbe.lean}" --about "$about" \
+      --json $out/measurements.json \
       canister.wasm canister-opt.wasm > $out/report.txt
   ''

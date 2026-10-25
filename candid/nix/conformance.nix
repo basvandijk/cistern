@@ -41,7 +41,7 @@ runCommand "candid-conformance"
     export LEAN_PATH=${candidC}/olean
     mkdir $out
     echo "The conformance suite of dfinity/candid at ${commit}." > $out/results.txt
-    if ! lean --run ${src}/Candid/Conformance.lean ${suite}/*.test.did >> $out/results.txt; then
+    if ! lean -j "$NIX_BUILD_CORES" --run ${src}/Candid/Conformance.lean ${suite}/*.test.did >> $out/results.txt; then
       # The failures and the totals, at the end of the build log, the part that Nix shows.
       grep -v '^pass ' $out/results.txt || true
       exit 1

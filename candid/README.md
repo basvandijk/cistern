@@ -8,10 +8,11 @@ text format of `.did` files, and type classes that map Lean types to Candid type
 
 It follows version 0.1.8 of the [specification][spec], and, where the specification leaves
 room, the Rust crate `candid` 0.10.38, both at commit 10423fae of dfinity/candid. It passes all
-467 assertions of the specification's conformance suite. It needs only Lean's `Init`,
-which is what a canister links (see [lean-wasm](../experiments/lean-wasm)), and runs on wasm32
-as on 64-bit platforms; the tests check that it gives the same results on both.
-[lean-canister](../experiments/lean-canister) uses it for its methods' arguments and replies.
+467 assertions of the specification's conformance suite. It needs only Lean's `Init`, which is
+what a canister links (see [The runtime for wasm32](../README.md#the-runtime-for-wasm32) in the
+root README), and runs on wasm32 as on 64-bit platforms.
+[lean-canister](../experiments/lean-canister) uses it for its methods' arguments and replies, which
+is where its 32-bit behavior is exercised (see [Building and testing](#building-and-testing)).
 
 ## Using it
 
@@ -114,20 +115,21 @@ The flake builds the library as:
 | Package | What |
 | ------- | ---- |
 | `candid-c` | the C of the modules (`c/`), and their `.olean` files (`olean/`), for `LEAN_PATH`; Candid.Derive has an `.olean` file only |
-| `candid-wasm` | `lib/libCandid.a`, the C compiled for wasm32-wasip1, to link with lean-wasm's `libInit.a` and `libleanrt.a` |
+| `candid-wasm` | `lib/libCandid.a`, the C compiled for wasm32-wasip1, to link with the flake's `libInit.a` (`lean-init`, [nix/lean-libs.nix](../nix/lean-libs.nix)) and `libleanrt.a` (`lean-runtime`, [nix/lean-runtime.nix](../nix/lean-runtime.nix)) |
 
 and checks it with:
 
 | Check | What |
 | ----- | ---- |
 | `candid-tests` | the test programs in [Candid/Tests/](Candid/Tests), with `lean --run`: Encode (200 checks), Decode (592), Parse (9,960, of which 51 on the `.did` files of the Rust parser's tests), RoundTrip (2,783) and Derive (114) |
-| `candid-tests-wasm` | the same programs but Derive.lean, and Parse without the Rust parser's files, compiled to wasm32 and run under wasmtime; the output must be that of a native run |
 | `candid-conformance` | [Conformance.lean](Candid/Conformance.lean) on the conformance suite, `test/*.test.did` of dfinity/candid |
 
 When a check fails, the end of its build log, which Nix shows, has the lines of the output that
-are not passed checks, or how the wasm32 output differs from the native one. The 32-bit run
-matters because the canister is 32-bit, where more numbers are bignums (see
-[Numbers](#numbers)) and `USize` has 32 bits.
+are not passed checks. The tests run natively only. The library's 32-bit behavior, which matters
+because the canister is 32-bit, where more numbers are bignums (see [Numbers](#numbers)) and
+`USize` has 32 bits, is exercised only in the canister, under PocketIC, whose methods' arguments
+and replies go through the library
+([Candid in the canister](../experiments/lean-canister/README.md#candid-in-the-canister)).
 
 The conformance suite and the Rust parser's files come from the flake input `candid`,
 dfinity/candid, at the commit that flake.lock pins. `nix flake update candid` moves it to the
@@ -205,7 +207,7 @@ the all-phase initializers of all the imports. A program's `main`, and lean-cani
 `canister_init`, call the runtime one. As nothing calls the others, wasm-ld leaves them out, and
 with them every reference to `Candid.Derive` and Lean: only they refer to the handler, which is
 why the canister can derive. It also leaves out Init's meta phase, which is most of Init's code
-(see lean-wasm's [Where the size comes from](../experiments/lean-wasm/README.md#where-the-size-comes-from)).
+(see [Where the size comes from](../README.md#where-the-size-comes-from) in the root README).
 
 A definition's body is visible to other modules only if it is *exposed* (`@[expose]`), or an
 `abbrev`, which Lean also unfolds wherever it compares types, as when it looks for an instance.

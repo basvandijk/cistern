@@ -1,9 +1,8 @@
 module
 
 /-!
-The probes, from the measurements of recursion depth and of `String.map` in
-../lean-wasm/README.md. The canister's `probe` query (Canister.lean) runs them in PocketIC, and
-RunProbe.lean under wasmtime and natively.
+The probes, which measure recursion depth and `String.map` (see README.md). The canister's
+`probe` query (Canister.lean) runs them in PocketIC, and RunProbe.lean natively.
 -/
 
 public section
@@ -46,7 +45,7 @@ structure Probe where
 def Probe.of (prepare : Nat → α) (run : α → Nat) : Probe := ⟨α, prepare, run⟩
 
 /-- The probes by name. In the canister, `toUpper` gets a shared string (see
-`Ic0.countInstructions`), as in the lean-wasm measurements. -/
+`Ic0.countInstructions`). -/
 def probes : List (String × Probe) := [
   -- No work: what measuring itself costs.
   ("noop", .of id id),

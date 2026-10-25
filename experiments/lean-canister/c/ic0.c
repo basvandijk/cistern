@@ -15,12 +15,16 @@ table: that is what a function pointer is on wasm32 (clang emits the index, and 
 the table, which the IC exports itself when it instruments the module). Their environment, the
 `env` that the IC passes back, is the Lean `IO.Promise` that Ic0.lean created for the call: its
 address, which does not change, as Lean objects do not move. The IC keeps that reference until a
-callback has run. on_response resolves the promise with the response, which runs the Lean tasks
-that wait on it, the rest of the handler up to its reply or its next call (lean-wasm's
-runtime/task-manager.patch makes resolving run them, before `resolve` returns), and then releases
-the promise. on_cleanup runs instead if on_response trapped, on the memory as it was before: it
-discards the promise, which frees what waits on it without running it (resolving or releasing
-the promise would run those tasks here, where they can neither reply nor call), and releases it.
+callback has run. on_response resolves the promise with the response, which queues the Lean
+tasks that wait on it (the task manager is cooperative, see canister.c: nothing runs inside
+`resolve`), runs the queue with lean_run_pending_tasks, which is the rest of the handler up to
+its reply or its next call, and then releases the promise. on_cleanup runs instead if
+on_response trapped, on the memory as it was before: it discards the promise with
+lean_io_promise_discard, which frees what waits on it without running or queuing it (resolving
+or releasing the promise would queue it, for the next message that runs the queue, where it
+could neither reply nor call), and releases it. It runs no Lean code, and does not run the
+queue: that is empty between messages, as every entry point and callback runs it before
+returning.
 */
 #include <inttypes.h>
 #include <stdio.h>
@@ -32,11 +36,6 @@ the promise would run those tasks here, where they can neither reply nor call), 
 /* `IO.Promise.resolve`, which lean.h does not declare: the value is owned, the promise borrowed,
    and the result is `lean_box(0)`. */
 lean_object * lean_io_promise_resolve(lean_object * value, lean_object * promise);
-
-/* `IO.Promise.discard`, of lean-wasm's runtime/task-manager.patch: resolves the promise with
-   `none`, and frees what waits on it without running it. The promise is borrowed, and the
-   result is `lean_box(0)`. */
-lean_object * lean_io_promise_discard(lean_object * promise);
 
 /* Ic0.lean's `Response.make`: a `Response` of the reject code, 0 for a reply, and the reply or
    the reject message, so that this file need not know the structure's layout. */
@@ -130,8 +129,8 @@ LEAN_EXPORT uint32_t cistern_ic0_outstanding_calls(void) {
     return g_outstanding;
 }
 
-/* The reply and reject callback: resolves the call's promise, `env`, with the response, which
-   runs what waits on it (see above), and ends like an entry point (canister.c), with the
+/* The reply and reject callback: resolves the call's promise, `env`, with the response, runs
+   what waits on it (see above), and ends like an entry point (canister.c), with the
    instructions of the whole call context (ic0.performance_counter(1)) among the details. */
 static void on_response(uint32_t env) {
     unsigned long time_calls = wasi_ic0_time_calls;
@@ -140,6 +139,8 @@ static void on_response(uint32_t env) {
     lean_object * data = code == 0 ? bytes(ic0_msg_arg_data_size(), ic0_msg_arg_data_copy)
                                    : bytes(ic0_msg_reject_msg_size(), ic0_msg_reject_msg_copy);
     lean_dec(lean_io_promise_resolve(cistern_ic0_mk_response(code, data), promise));
+    // The handler's continuation, which resolving queued: the rest of it, its reply or next call.
+    lean_run_pending_tasks();
     lean_dec(promise);
     g_outstanding--;
     char details[96];
@@ -151,7 +152,8 @@ static void on_response(uint32_t env) {
 /* The cleanup callback: on_response trapped, and the IC discarded what it changed, so the
    promise is as it was before, unresolved, with the handler's continuation waiting on it. Only a
    few System API functions may be called here, among them ic0.debug_print and
-   ic0.performance_counter, so the continuation is discarded (see above). */
+   ic0.performance_counter, so the continuation is discarded, with lean_io_promise_discard, which
+   runs no Lean code; the queue is not run (see above). */
 static void on_cleanup(uint32_t env) {
     unsigned long time_calls = wasi_ic0_time_calls;
     lean_object * promise = (lean_object *)(uintptr_t)env;
